@@ -8,4 +8,4 @@ HelicDAQ = "0.1"
 julia = "1.10"
 
 [sources]
-HelicDAQ = {path = "helic-daq/host-julia"}
+HelicDAQ = {path = "/Users/yidongqiu/Library/CloudStorage/OneDrive-UniversityofBristol/Desktop/helic-daq/host-julia"}

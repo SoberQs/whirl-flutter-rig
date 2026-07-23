@@ -1,3 +1,0 @@
-[submodule "helic-daq"]
-	path = helic-daq
-	url = https://github.com/dawbarton/helic-daq.git
