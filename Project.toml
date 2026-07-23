@@ -1,0 +1,11 @@
+[deps]
+GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+HelicDAQ = "6b88281e-bae6-4915-a49f-494816281d59"
+
+[compat]
+GLMakie = "0.13"
+HelicDAQ = "0.1"
+julia = "1.10"
+
+[sources]
+HelicDAQ = {path = "/Users/yidongqiu/Library/CloudStorage/OneDrive-UniversityofBristol/Desktop/helic-daq/host-julia"}
