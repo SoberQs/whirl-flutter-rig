@@ -1,10 +1,12 @@
 # Offline CSV plotting for captures saved by the whirl-rig live GUI.
 
 using GLMakie
+import CairoMakie
 
 const WHIRL_CSV_COLUMNS = ("time_s", "sample_index", "pitch_deg", "yaw_deg", "rpm")
 const MAX_OFFLINE_PLOT_POINTS = 100_000
 const OFFLINE_ANGLE_MARGIN_DEGREES = 10.0
+const SUPPORTED_OUTPUT_EXTENSIONS = (".png", ".pdf", ".svg")
 
 function _parse_csv_value(::Type{T}, text, row, column) where {T}
     value = tryparse(T, strip(text))
@@ -85,6 +87,18 @@ function _offline_angle_plot_limits(pitch, yaw)
     return -extent, extent
 end
 
+function _output_backend(path::AbstractString)
+    extension = lowercase(splitext(path)[2])
+    extension == ".png" && return GLMakie
+    extension in (".pdf", ".svg") && return CairoMakie
+    throw(
+        ArgumentError(
+            "unsupported output extension '$extension'; expected one of " *
+            join(SUPPORTED_OUTPUT_EXTENSIONS, ", "),
+        ),
+    )
+end
+
 """Plot pitch, yaw, and rotor speed from a whirl GUI CSV capture.
 
 Set `output` to a `.png`, `.pdf`, or `.svg` path to save the figure. The
@@ -161,8 +175,9 @@ function plot_whirl_csv(path::AbstractString; output::Union{Nothing, AbstractStr
 
     if !isnothing(output)
         output_path = abspath(expanduser(output))
+        backend = _output_backend(output_path)
         mkpath(dirname(output_path))
-        save(output_path, figure)
+        save(output_path, figure; backend)
     end
     return figure
 end

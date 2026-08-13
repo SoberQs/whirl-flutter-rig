@@ -49,8 +49,8 @@ Pkg.precompile()
 '
 ```
 
-This links the `HelicDAQ` source tree from the pinned submodule, installs
-GLMakie, and precompiles the environment.
+This links the `HelicDAQ` source tree from the pinned submodule, installs the
+GLMakie and CairoMakie plotting backends, and precompiles the environment.
 
 To verify that Julia is loading the expected package:
 
@@ -111,4 +111,10 @@ julia --project=. src/plot.jl \
     captures/whirl_capture_20260723_132504_521.csv plot.png
 ```
 
-PNG, PDF, and SVG output formats are supported.
+PNG, PDF, and SVG output formats are supported. PNG output uses GLMakie, while
+PDF and SVG output use CairoMakie for native vector rendering.
+
+```sh
+julia --project=. src/plot.jl captures/example.csv plot.pdf
+julia --project=. src/plot.jl captures/example.csv plot.svg
+```
