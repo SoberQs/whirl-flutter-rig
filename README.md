@@ -11,16 +11,23 @@ This project uses the Julia interface provided by
 [`dawbarton/helic-daq`](https://github.com/dawbarton/helic-daq). The Julia
 package is located in the upstream repository's `host-julia/` directory.
 
-`HelicDAQ` is currently used as a local development dependency because it is
-not installed from the Julia General registry. Clone the upstream repository
-next to this project:
+The upstream repository is included as the `helic-daq` Git submodule and is
+pinned to commit
+[`02139fbebd20ae5a9c830102ff746d483ebbf1bb`](https://github.com/dawbarton/helic-daq/commit/02139fbebd20ae5a9c830102ff746d483ebbf1bb).
+
+Clone this project and initialise the submodule in one step:
 
 ```sh
-git clone https://github.com/dawbarton/helic-daq.git ../helic-daq
+git clone --recurse-submodules \
+    https://github.com/SoberQs/whirl-flutter-rig.git
 ```
 
-If the repository is cloned elsewhere, replace `../helic-daq/host-julia` in
-the setup command below with the appropriate path.
+If the project has already been cloned without its submodule, run the
+following command from the project root:
+
+```sh
+git submodule update --init --recursive
+```
 
 ## Requirements
 
@@ -36,14 +43,14 @@ Run the following command from the project root:
 ```sh
 julia --project=. -e '
 using Pkg
-Pkg.develop(path="../helic-daq/host-julia")
+Pkg.develop(path="helic-daq/host-julia")
 Pkg.instantiate()
 Pkg.precompile()
 '
 ```
 
-This creates or updates `Project.toml` and `Manifest.toml`, links the local
-`HelicDAQ` source tree, installs GLMakie, and precompiles the environment.
+This links the `HelicDAQ` source tree from the pinned submodule, installs
+GLMakie, and precompiles the environment.
 
 To verify that Julia is loading the expected package:
 

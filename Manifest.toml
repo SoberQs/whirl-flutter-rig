@@ -543,8 +543,8 @@ uuid = "2e76f6c2-a576-52d4-95c1-20adfe4de566"
 version = "8.5.1+0"
 
 [[deps.HelicDAQ]]
-deps = ["Dates", "GLMakie", "Sockets", "Tables"]
-path = "/Users/yidongqiu/Library/CloudStorage/OneDrive-UniversityofBristol/Desktop/helic-daq/host-julia"
+deps = ["Sockets", "Tables"]
+path = "helic-daq/host-julia"
 uuid = "6b88281e-bae6-4915-a49f-494816281d59"
 version = "0.1.0"
 
