@@ -5,6 +5,7 @@
 using Dates
 using GLMakie
 using HelicDAQ
+using Printf
 
 const DEFAULT_HOST = "192.168.1.238"
 const WHIRL_SOURCES = (:pitch, :yaw, :rpm)
@@ -14,6 +15,7 @@ const STREAM_TIMEOUT_SECONDS = 5.0
 const MAX_STREAM_RESTARTS = 3
 const CONTROL_KEEPALIVE_SECONDS = 10.0
 const ANGLE_MARGIN_DEGREES = 10.0f0
+const RPM_MARGIN = 1_000.0
 
 mutable struct WhirlApp
     host::String
@@ -46,6 +48,7 @@ mutable struct WhirlApp
     status_text::Observable{String}
     stats_text::Observable{String}
     info_text::Observable{String}
+    rpm_text::Observable{String}
     angle_axis::Any
     rpm_axis::Any
     save_path::Any
@@ -84,6 +87,7 @@ function WhirlApp(host, demo, decimation, window_seconds)
         Observable("Idle"),
         Observable("0 samples"),
         Observable(demo ? "Demo mode — click Start" : "Target: $host"),
+        Observable("— RPM"),
         nothing,
         nothing,
         nothing,
@@ -216,6 +220,31 @@ function build_figure!(app::WhirlApp)
         justification = :left,
         word_wrap = true,
     )
+    rpm_readout = GridLayout(;
+        tellwidth = true,
+        width = 260,
+        valign = :bottom,
+        rowgap = 2,
+    )
+    figure[3:4, 2] = rpm_readout
+    Label(
+        rpm_readout[1, 1],
+        "LIVE ROTOR SPEED";
+        fontsize = 14,
+        font = :bold,
+        halign = :right,
+        tellwidth = false,
+        color = RGBf(0.32, 0.42, 0.58),
+    )
+    Label(
+        rpm_readout[2, 1],
+        app.rpm_text;
+        fontsize = 32,
+        font = :bold,
+        halign = :right,
+        tellwidth = false,
+        color = RGBf(0.08, 0.52, 0.36),
+    )
 
     colsize!(figure.layout, 1, Relative(0.81))
     colsize!(figure.layout, 2, Fixed(270))
@@ -269,6 +298,11 @@ function _angle_plot_limits(pitch, yaw)
     absolute_maximum = max(maximum(abs, pitch), maximum(abs, yaw))
     extent = absolute_maximum + ANGLE_MARGIN_DEGREES
     return -Float64(extent), Float64(extent)
+end
+
+function _rpm_plot_limits(rpm)
+    value = Float64(rpm)
+    return max(0.0, value - RPM_MARGIN), value + RPM_MARGIN
 end
 
 function append_packet!(app::WhirlApp, header, values)
@@ -500,7 +534,9 @@ function clear_data!(app::WhirlApp)
     app.plot_pitch_points[] = Point2f[]
     app.plot_yaw_points[] = Point2f[]
     app.plot_rpm_points[] = Point2f[]
+    app.rpm_text[] = "— RPM"
     ylims!(app.angle_axis, -ANGLE_MARGIN_DEGREES, ANGLE_MARGIN_DEGREES)
+    ylims!(app.rpm_axis, 0, 6_500)
     app.status_text[] = app.running ? app.status_text[] : "Idle"
     app.info_text[] = app.running ? "Buffer cleared; acquisition continues" : "Buffer cleared"
     return nothing
@@ -553,6 +589,9 @@ function update_plots!(app::WhirlApp)
     count = length(app.times)
     app.stats_text[] = "$(count) samples\nDevice drops: $(app.dropped)\nUDP gaps: $(app.lost_packets)"
     count == 0 && return nothing
+    current_rpm = app.rpm[end]
+    app.rpm_text[] = @sprintf("%.0f RPM", current_rpm)
+    ylims!(app.rpm_axis, _rpm_plot_limits(current_rpm)...)
     first_visible = searchsortedfirst(app.times, max(0.0, app.times[end] - app.window_seconds))
     stride = max(1, cld(count - first_visible + 1, MAX_PLOT_POINTS))
     selection = first_visible:stride:count
