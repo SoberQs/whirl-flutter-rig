@@ -12,8 +12,8 @@ This project uses the Julia interface provided by
 package is located in the upstream repository's `host-julia/` directory.
 
 The upstream repository is included as the `helic-daq` Git submodule and is
-pinned to commit
-[`02139fbebd20ae5a9c830102ff746d483ebbf1bb`](https://github.com/dawbarton/helic-daq/commit/02139fbebd20ae5a9c830102ff746d483ebbf1bb).
+pinned to release `v0.3.0`, commit
+[`3dbe99619c3066e8a24e75b46b99e7e68acef566`](https://github.com/dawbarton/helic-daq/commit/3dbe99619c3066e8a24e75b46b99e7e68acef566).
 
 Clone this project and initialise the submodule in one step:
 

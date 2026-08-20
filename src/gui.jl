@@ -4,7 +4,8 @@
 
 using Dates
 using GLMakie
-using HelicDAQ
+import HelicDAQ
+using HelicDAQ: configure_stream!, start_stream!, stop_stream!
 using Printf
 
 const DEFAULT_HOST = "192.168.1.238"
@@ -26,8 +27,8 @@ mutable struct WhirlApp
     running::Bool
     busy::Bool
     session::UInt64
-    device::Union{Nothing, Device}
-    receiver::Union{Nothing, StreamReceiver}
+    device::Union{Nothing, HelicDAQ.Device}
+    receiver::Union{Nothing, HelicDAQ.StreamReceiver}
     times::Vector{Float64}
     sample_indices::Vector{UInt64}
     pitch_degrees::Vector{Float32}
@@ -346,17 +347,18 @@ function append_demo_chunk!(app::WhirlApp)
     return nothing
 end
 
-function _check_whirl_device(device::Device)
+function _check_whirl_device(device::HelicDAQ.Device)
     experiment = try
         String(device[:experiment])
     catch error
-        error isa DeviceError ? "unknown" : rethrow()
+        error isa HelicDAQ.DeviceError ? "unknown" : rethrow()
     end
     experiment == "whirl-rig" ||
-        throw(DeviceError("connected experiment is '$experiment', expected 'whirl-rig'"))
+        throw(HelicDAQ.DeviceError("connected experiment is '$experiment', expected 'whirl-rig'"))
     available = Set(source.name for source in device.sources)
     missing = [String(source) for source in WHIRL_SOURCES if String(source) ∉ available]
-    isempty(missing) || throw(DeviceError("firmware is missing sources: $(join(missing, ", "))"))
+    isempty(missing) ||
+        throw(HelicDAQ.DeviceError("firmware is missing sources: $(join(missing, ", "))"))
     return nothing
 end
 
@@ -378,15 +380,15 @@ function start_receiving!(app::WhirlApp)
         end
 
         if isnothing(app.device) || !isopen(app.device)
-            app.device = Device(app.host; timeout = 3.0)
+            app.device = HelicDAQ.Device(app.host; timeout = 3.0)
         end
         _check_whirl_device(app.device)
-        device_status = status(app.device)
+        device_status = HelicDAQ.status(app.device)
         app.sample_rate = Float64(device_status.sample_rate)
         configure_stream!(app.device, WHIRL_SOURCES; decimation = app.decimation, count = 0)
-        receiver = StreamReceiver(; port = 0, timeout = STREAM_TIMEOUT_SECONDS)
+        receiver = HelicDAQ.StreamReceiver(; port = 0, timeout = STREAM_TIMEOUT_SECONDS)
         app.receiver = receiver
-        prime!(receiver, app.host)
+        HelicDAQ.prime!(receiver, app.host)
         if session != app.session
             _close_receiver!(app)
             _close_device!(app)
@@ -426,7 +428,7 @@ function keepalive_loop!(app::WhirlApp, session::UInt64)
         sleep(CONTROL_KEEPALIVE_SECONDS)
         app.running && session == app.session || break
         try
-            status(app.device)
+            HelicDAQ.status(app.device)
         catch error
             app.running && session == app.session || break
             app.running = false
@@ -452,14 +454,14 @@ function _restart_stream!(app::WhirlApp, session::UInt64, attempt::Int)
     app.status_text[] = "Reconnecting…"
     app.info_text[] = "No packet for $(STREAM_TIMEOUT_SECONDS) s; restart $attempt/$MAX_STREAM_RESTARTS"
     if isnothing(app.device) || !isopen(app.device)
-        throw(DeviceError("control connection closed during stream restart"))
+        throw(HelicDAQ.DeviceError("control connection closed during stream restart"))
     end
     stop_stream!(app.device)
     _close_receiver!(app)
     session == app.session || return false
-    receiver = StreamReceiver(; port = 0, timeout = STREAM_TIMEOUT_SECONDS)
+    receiver = HelicDAQ.StreamReceiver(; port = 0, timeout = STREAM_TIMEOUT_SECONDS)
     app.receiver = receiver
-    prime!(receiver, app.host)
+    HelicDAQ.prime!(receiver, app.host)
     start_stream!(app.device, receiver.port)
     app.status_text[] = "Receiving · LIVE"
     app.info_text[] = "Stream recovered automatically · decimation $(app.decimation)"
@@ -470,12 +472,12 @@ function receive_loop!(app::WhirlApp, session::UInt64)
     restart_attempts = 0
     while app.running && session == app.session
         try
-            header, values = receive(app.receiver)
+            header, values = HelicDAQ.receive(app.receiver)
             session == app.session || break
             append_packet!(app, header, values)
             restart_attempts = 0
         catch error
-            if error isa StreamTimeout && restart_attempts < MAX_STREAM_RESTARTS
+            if error isa HelicDAQ.StreamTimeout && restart_attempts < MAX_STREAM_RESTARTS
                 restart_attempts += 1
                 try
                     _restart_stream!(app, session, restart_attempts) || break

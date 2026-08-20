@@ -2,7 +2,7 @@
 
 julia_version = "1.11.3"
 manifest_format = "2.0"
-project_hash = "f5acfda80893cad23f38615ac73df28f9b673fec"
+project_hash = "fcb79a827ff86c7ecb76a14dfaf4a47bd6df29cf"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -564,7 +564,7 @@ version = "8.5.1+0"
 deps = ["Sockets", "Tables"]
 path = "helic-daq/host-julia"
 uuid = "6b88281e-bae6-4915-a49f-494816281d59"
-version = "0.1.0"
+version = "0.2.0"
 
 [[deps.HypergeometricFunctions]]
 deps = ["Gamma", "LinearAlgebra"]
