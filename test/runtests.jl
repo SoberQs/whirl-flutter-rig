@@ -4,6 +4,13 @@ using Test
 
 include(joinpath(@__DIR__, "..", "src", "gui.jl"))
 
+@testset "pitch-yaw orbit limits" begin
+    @test _orbit_plot_limits(Float32[0.0], Float32[0.0]) == (-1.0, 1.0)
+    lower, upper = _orbit_plot_limits(Float32[-2.0, 3.0], Float32[-4.0, 1.0])
+    @test lower ≈ -4.4
+    @test upper ≈ 4.4
+end
+
 const TEST_PROFILE_SET = load_motor_profiles()
 const TEST_PROFILE = profile_by_id(TEST_PROFILE_SET, TEST_PROFILE_SET.default_id)
 

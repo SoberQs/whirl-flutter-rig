@@ -1,10 +1,10 @@
 # Whirl Flutter Rig
 
 Live data acquisition and offline plotting tools for the HELIC whirl-flutter
-rig. The live interface displays pitch, yaw, rotor-speed, speed-reference, and
-ESC-command measurements, provides manual and closed-loop motor control, and
-can save complete acquisitions as CSV files. Saved captures can then be
-inspected interactively or exported as PNG, PDF, or SVG figures.
+rig. The live interface displays pitch, yaw, the pitch–yaw orbit, rotor speed,
+speed reference, and ESC-command measurements, provides manual and closed-loop
+motor control, and can save complete acquisitions as CSV files. Saved captures
+can then be inspected interactively or exported as PNG, PDF, or SVG figures.
 
 ## HELIC-DAQ dependency
 

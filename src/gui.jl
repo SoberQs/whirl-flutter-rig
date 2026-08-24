@@ -26,6 +26,8 @@ const STREAM_TIMEOUT_SECONDS = 5.0
 const MAX_STREAM_RESTARTS = 3
 const CONTROL_STATE_POLL_SECONDS = 0.5
 const ANGLE_MARGIN_DEGREES = 10.0f0
+const ORBIT_MINIMUM_EXTENT_DEGREES = 1.0
+const ORBIT_MARGIN_FRACTION = 0.1
 const RPM_MARGIN = 1_000.0
 const MOTOR_COMMAND_INTERVAL_SECONDS = 0.05
 
@@ -61,6 +63,8 @@ mutable struct WhirlApp
     plot_yaw_points::Observable{Vector{Point2f}}
     plot_rpm_points::Observable{Vector{Point2f}}
     plot_target_points::Observable{Vector{Point2f}}
+    plot_orbit_points::Observable{Vector{Point2f}}
+    plot_orbit_current::Observable{Vector{Point2f}}
     status_text::Observable{String}
     stats_text::Observable{String}
     info_text::Observable{String}
@@ -79,6 +83,7 @@ mutable struct WhirlApp
     last_motor_command_s::Float64
     angle_axis::Any
     rpm_axis::Any
+    orbit_axis::Any
     save_path::Any
     target_rpm_box::Any
     profile_menu::Any
@@ -120,6 +125,8 @@ function WhirlApp(host, demo, decimation, window_seconds)
         Observable(Point2f[]),
         Observable(Point2f[]),
         Observable(Point2f[]),
+        Observable(Point2f[]),
+        Observable(Point2f[]),
         Observable("Idle"),
         Observable("0 samples"),
         Observable(demo ? "Demo mode — click Start" : "Target: $host"),
@@ -136,6 +143,7 @@ function WhirlApp(host, demo, decimation, window_seconds)
         UInt32(0),
         false,
         -Inf,
+        nothing,
         nothing,
         nothing,
         nothing,
@@ -183,11 +191,20 @@ function build_figure!(app::WhirlApp)
         xlabel = "Time [s]",
         ylabel = "Angle [deg]",
     )
+    lower_plots = GridLayout(; colgap = 18)
+    figure[4, 1] = lower_plots
     rpm_axis = Axis(
-        figure[4, 1];
+        lower_plots[1, 1];
         title = "Rotor speed",
         xlabel = "Time [s]",
         ylabel = "Speed [RPM]",
+    )
+    orbit_axis = Axis(
+        lower_plots[1, 2];
+        title = "Pitch–yaw orbit (orange = latest)",
+        xlabel = "Pitch [deg]",
+        ylabel = "Yaw [deg]",
+        aspect = DataAspect(),
     )
     lines!(angle_axis, app.plot_pitch_points; color = RGBf(0.1, 0.42, 0.9), linewidth = 2, label = "Pitch")
     lines!(angle_axis, app.plot_yaw_points; color = RGBf(0.92, 0.28, 0.32), linewidth = 2, label = "Yaw")
@@ -200,12 +217,32 @@ function build_figure!(app::WhirlApp)
         linestyle = :dash,
         label = "Target",
     )
+    hlines!(orbit_axis, [0.0]; color = RGBf(0.68, 0.71, 0.76), linewidth = 1, linestyle = :dot)
+    vlines!(orbit_axis, [0.0]; color = RGBf(0.68, 0.71, 0.76), linewidth = 1, linestyle = :dot)
+    lines!(
+        orbit_axis,
+        app.plot_orbit_points;
+        color = RGBf(0.43, 0.25, 0.78),
+        linewidth = 2,
+    )
+    scatter!(
+        orbit_axis,
+        app.plot_orbit_current;
+        color = RGBf(0.93, 0.45, 0.12),
+        markersize = 11,
+        strokecolor = :white,
+        strokewidth = 1.5,
+    )
     axislegend(angle_axis; position = :lb, framevisible = false, orientation = :horizontal)
     axislegend(rpm_axis; position = :lb, framevisible = false, orientation = :horizontal)
     ylims!(angle_axis, -ANGLE_MARGIN_DEGREES, ANGLE_MARGIN_DEGREES)
     ylims!(rpm_axis, 0, 6_500)
     xlims!(angle_axis, 0, app.window_seconds)
     xlims!(rpm_axis, 0, app.window_seconds)
+    xlims!(orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
+    ylims!(orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
+    colsize!(lower_plots, 1, Relative(0.5))
+    colsize!(lower_plots, 2, Relative(0.5))
 
     controls = GridLayout(;
         tellwidth = true,
@@ -366,6 +403,7 @@ function build_figure!(app::WhirlApp)
 
     app.angle_axis = angle_axis
     app.rpm_axis = rpm_axis
+    app.orbit_axis = orbit_axis
     app.save_path = save_path
     app.target_rpm_box = target_rpm_box
     app.profile_menu = profile_menu
@@ -449,6 +487,15 @@ end
 function _angle_plot_limits(pitch, yaw)
     absolute_maximum = max(maximum(abs, pitch), maximum(abs, yaw))
     extent = absolute_maximum + ANGLE_MARGIN_DEGREES
+    return -Float64(extent), Float64(extent)
+end
+
+function _orbit_plot_limits(pitch, yaw)
+    absolute_maximum = max(maximum(abs, pitch), maximum(abs, yaw))
+    extent = max(
+        ORBIT_MINIMUM_EXTENT_DEGREES,
+        (1 + ORBIT_MARGIN_FRACTION) * absolute_maximum,
+    )
     return -Float64(extent), Float64(extent)
 end
 
@@ -786,8 +833,11 @@ function append_demo_chunk!(app::WhirlApp)
     for _ in 1:count
         index = app.demo_index
         time_s = index / app.sample_rate
-        pitch = 360 * mod(0.17 * time_s + 0.025 * sinpi(0.7 * time_s), 1)
-        yaw = 360 * mod(0.11 * time_s + 0.018 * sinpi(1.1 * time_s + 0.3), 1)
+        # Ramp away from the sampled zero before settling into a slightly
+        # distorted ellipse, so demo mode exercises the orbit display.
+        envelope = min(1.0, time_s / 0.5)
+        pitch = 45 + 3.2 * envelope * sinpi(4 * time_s)
+        yaw = 120 + envelope * (2.2 * sinpi(4 * time_s + 0.55) + 0.35 * sinpi(8 * time_s))
         target = app.motor_mode == :speed && app.armed ? app.target_rpm : 0.0f0
         speed = target > 0 ? target + 120 * sinpi(1.7 * time_s) : 0.0
         throttle = app.armed ? app.manual_throttle : 0.0f0
@@ -1036,9 +1086,13 @@ function clear_data!(app::WhirlApp)
     app.plot_yaw_points[] = Point2f[]
     app.plot_rpm_points[] = Point2f[]
     app.plot_target_points[] = Point2f[]
+    app.plot_orbit_points[] = Point2f[]
+    app.plot_orbit_current[] = Point2f[]
     app.rpm_text[] = "— RPM"
     ylims!(app.angle_axis, -ANGLE_MARGIN_DEGREES, ANGLE_MARGIN_DEGREES)
     ylims!(app.rpm_axis, 0, 6_500)
+    xlims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
+    ylims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     app.status_text[] = app.running ? app.status_text[] : "Idle"
     app.info_text[] = app.running ? "Buffer cleared; acquisition continues" : "Buffer cleared"
     return nothing
@@ -1117,7 +1171,8 @@ function update_plots!(app::WhirlApp)
     ylims!(app.rpm_axis, _rpm_plot_limits(rpm_extent)...)
     first_visible = searchsortedfirst(app.times, max(0.0, app.times[end] - app.window_seconds))
     stride = max(1, cld(count - first_visible + 1, MAX_PLOT_POINTS))
-    selection = first_visible:stride:count
+    selection = collect(first_visible:stride:count)
+    selection[end] == count || push!(selection, count)
     plot_time = app.times[selection]
     plot_pitch = app.pitch_degrees[selection]
     plot_yaw = app.yaw_degrees[selection]
@@ -1129,12 +1184,20 @@ function update_plots!(app::WhirlApp)
     app.plot_yaw_points[] = Point2f.(plot_time, plot_yaw)
     app.plot_rpm_points[] = Point2f.(plot_time, app.rpm[selection])
     app.plot_target_points[] = Point2f.(plot_time, app.rpm_target[selection])
+    app.plot_orbit_points[] = Point2f.(plot_pitch, plot_yaw)
+    app.plot_orbit_current[] = Point2f[(app.pitch_degrees[end], app.yaw_degrees[end])]
     _update_motor_text!(app)
     angle_lower, angle_upper = _angle_plot_limits(
         @view(app.pitch_degrees[first_visible:count]),
         @view(app.yaw_degrees[first_visible:count]),
     )
     ylims!(app.angle_axis, angle_lower, angle_upper)
+    orbit_lower, orbit_upper = _orbit_plot_limits(
+        @view(app.pitch_degrees[first_visible:count]),
+        @view(app.yaw_degrees[first_visible:count]),
+    )
+    xlims!(app.orbit_axis, orbit_lower, orbit_upper)
+    ylims!(app.orbit_axis, orbit_lower, orbit_upper)
     right = max(app.window_seconds, app.times[end])
     left = max(0.0, right - app.window_seconds)
     xlims!(app.angle_axis, left, right)
