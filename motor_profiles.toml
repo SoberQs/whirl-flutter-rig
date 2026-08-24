@@ -1,0 +1,32 @@
+# Host operating profiles constrained by the firmware's independent safety limits.
+
+schema_version = 1
+default_profile = "mn2806_kv400_air40a_16v5"
+
+[[profiles]]
+id = "mn2806_kv400_air40a_16v5"
+label = "MN2806 KV400 · AIR 40A · 16.5 V"
+motor_model = "T-Motor MN2806 KV400"
+motor_kv = 400.0
+supply_cells_min = 4
+supply_cells_max = 6
+tested_supply_v = 16.5
+
+# The configured GUI envelope extends beyond the 2026-08-24 hardware evidence
+# recorded below. The firmware independently clamps targets to 6000 RPM and
+# trips above 6500 RPM.
+target_min_rpm = 2000.0
+target_max_rpm = 6000.0
+manual_max_throttle = 0.90
+
+kp = 0.00016666667
+ki = 0.00005
+ramp_per_s = 0.20
+feedback_timeout_s = 2.0
+feedback_required_above = 0.15
+
+esc_pwm_hz = 50
+esc_min_pulse_us = 1100
+esc_max_pulse_us = 1940
+esc_calibration_status = "Factory-default endpoints accepted; full travel not independently calibrated"
+hardware_evidence = "16.5 V supply; manual 5–20%; closed-loop 2000–3000 RPM; 2026-08-24"
