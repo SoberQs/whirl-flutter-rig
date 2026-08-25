@@ -92,6 +92,48 @@ end
 
 include(joinpath(@__DIR__, "..", "src", "plot.jl"))
 
+@testset "offline pitch-yaw orbit limits" begin
+    @test _offline_orbit_plot_limits([0.0], [0.0]) == (-1.0, 1.0)
+    lower, upper = _offline_orbit_plot_limits([-2.0, 3.0], [-4.0, 1.0])
+    @test lower ≈ -4.4
+    @test upper ≈ 4.4
+end
+
+@testset "offline plot and time selection" begin
+    @test _normalise_plots((:rpm, :angles)) == (:angles, :rpm)
+    @test _normalise_plots(("orbit", "throttle")) == (:pitch_yaw, :esc)
+    @test _normalise_plots("all") == OFFLINE_PLOTS
+    @test_throws ArgumentError _normalise_plots(())
+    @test_throws ArgumentError _normalise_plots(("temperature",))
+
+    times = [0.0, 0.5, 1.0, 1.5]
+    @test _time_interval(times; start_time = 0.2, end_time = 1.1) == 2:3
+    @test _time_interval(times; start_time = 1.0) == 3:4
+    @test _time_interval(times; end_time = 0.5) == 1:2
+    @test_throws ArgumentError _time_interval(times; start_time = 2.0)
+    @test_throws ArgumentError _time_interval(times; start_time = 1.0, end_time = 0.5)
+
+    options = _parse_plot_arguments(
+        [
+            "capture.csv",
+            "plot.png",
+            "--plot",
+            "rpm,pitch-yaw",
+            "--start",
+            "10",
+            "--end",
+            "20.5",
+        ],
+    )
+    @test options.input == "capture.csv"
+    @test options.output == "plot.png"
+    @test options.plots == (:rpm, :pitch_yaw)
+    @test options.start_time == 10.0
+    @test options.end_time == 20.5
+    @test_throws ArgumentError _parse_plot_arguments(String[])
+    @test_throws ArgumentError _parse_plot_arguments(["capture.csv", "--plot", "unknown"])
+end
+
 @testset "capture CSV compatibility" begin
     mktempdir() do directory
         legacy_path = joinpath(directory, "legacy.csv")

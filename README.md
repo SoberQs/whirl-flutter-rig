@@ -175,6 +175,24 @@ julia --project=. src/plot.jl \
     captures/whirl_capture_20260723_132504_521.csv plot.png
 ```
 
+Select one or more panels with `--plot`. The accepted names are `angles`,
+`rpm`, `pitch-yaw`, and `esc`; comma-separated names and repeated `--plot`
+options are both supported:
+
+```sh
+julia --project=. src/plot.jl captures/example.csv --plot rpm
+julia --project=. src/plot.jl captures/example.csv \
+    --plot angles,pitch-yaw --output angles-and-orbit.png
+```
+
+Restrict the plot to an inclusive capture-time interval with `--start` and
+`--end` (in seconds). Either bound may be omitted:
+
+```sh
+julia --project=. src/plot.jl captures/example.csv \
+    --plot rpm --start 60 --end 120
+```
+
 PNG, PDF, and SVG output formats are supported. PNG output uses GLMakie, while
 PDF and SVG output use CairoMakie for native vector rendering.
 
