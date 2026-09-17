@@ -32,6 +32,31 @@ end
     @test isempty(buffer)
 end
 
+@testset "live angle FFT" begin
+    short_plot_app = WhirlApp("offline", false, 2, 3.0)
+    @test length(short_plot_app.plot_buffer.storage) == 10_001
+
+    sample_rate = 200.0
+    times = collect(0:(1 / sample_rate):(10 - 1 / sample_rate))
+    signal = @. 3 * sinpi(25 * times)
+    spectrum = _amplitude_spectrum(signal, sample_rate)
+    peak = argmax(spectrum.amplitude)
+    @test spectrum.frequency_hz[peak] ≈ 12.5
+    @test spectrum.amplitude[peak] ≈ 3.0 atol = 0.01
+
+    buffer = PlotRingBuffer(1_300)
+    for time_s in 0.0:0.01:12.0
+        time_s == 7.0 && continue
+        push!(buffer, _test_plot_sample(time_s))
+    end
+    window = _interpolated_angle_window(buffer, 100.0, 1)
+    @test length(window.pitch) == 1_000
+    @test window.pitch[1] ≈ 2.01 atol = 1.0e-6
+    @test window.pitch[end] ≈ 12.0 atol = 1.0e-6
+    @test window.pitch[500] ≈ 7.0 atol = 1.0e-6
+    @test window.yaw == -window.pitch
+end
+
 @testset "packet plotting window is bounded" begin
     app = WhirlApp("offline", false, 1, 10.0)
     _resize_plot_buffer!(app.plot_buffer, 2)

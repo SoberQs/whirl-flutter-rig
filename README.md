@@ -2,9 +2,9 @@
 
 Live data acquisition and offline plotting tools for the HELIC whirl-flutter
 rig. The live interface displays pitch, yaw, the pitch–yaw orbit, rotor speed,
-speed reference, and ESC-command measurements, provides manual and closed-loop
-motor control, and can save complete acquisitions as CSV files. Saved captures
-can then be inspected interactively or exported as PNG, PDF, or SVG figures.
+and a switchable live angle spectrum, provides manual and closed-loop motor
+control, and can save complete acquisitions as CSV files. Saved captures can
+then be inspected interactively or exported as PNG, PDF, or SVG figures.
 
 ## HELIC-DAQ dependency
 
@@ -85,6 +85,13 @@ specified explicitly:
 julia --project=. src/gui.jl \
     --host 192.168.1.238 --decimation 2 --window 20
 ```
+
+The button below the lower-left plot switches between rotor speed and a live
+pitch/yaw FFT. The spectrum uses the most recent 10 seconds, removes each
+angle's mean, applies a Hann window, and displays single-sided amplitudes up to
+200 Hz. Missing streamed samples are linearly interpolated onto the known
+sample clock before transforming. The pitch–yaw orbit uses yaw on the
+horizontal axis and pitch on the vertical axis.
 
 On macOS, `run_gui.command` can also be opened directly from Finder. Pass
 `--demo` when launching it from Terminal to use simulated input:

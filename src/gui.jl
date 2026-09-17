@@ -3,6 +3,7 @@
 # julia --project=. src/gui.jl --demo
 
 using Dates
+using FFTW: rfft
 using GLMakie
 import HelicDAQ
 using HelicDAQ: configure_stream!, start_stream!, stop_stream!
@@ -32,6 +33,10 @@ const CONTROL_STATE_POLL_SECONDS = 0.5
 const ANGLE_MARGIN_DEGREES = 10.0f0
 const ORBIT_MINIMUM_EXTENT_DEGREES = 1.0
 const ORBIT_MARGIN_FRACTION = 0.1
+const FFT_WINDOW_SECONDS = 10.0
+const FFT_REFRESH_SECONDS = 0.25
+const FFT_MAX_FREQUENCY_HZ = 200.0
+const FFT_MINIMUM_AMPLITUDE_DEGREES = 0.1
 const RPM_MARGIN = 1_000.0
 const MOTOR_COMMAND_INTERVAL_SECONDS = 0.05
 
@@ -169,6 +174,8 @@ mutable struct WhirlApp
     plot_yaw_points::Observable{Vector{Point2f}}
     plot_rpm_points::Observable{Vector{Point2f}}
     plot_target_points::Observable{Vector{Point2f}}
+    plot_fft_pitch_points::Observable{Vector{Point2f}}
+    plot_fft_yaw_points::Observable{Vector{Point2f}}
     plot_orbit_points::Observable{Vector{Point2f}}
     plot_orbit_current::Observable{Vector{Point2f}}
     status_text::Observable{String}
@@ -188,9 +195,15 @@ mutable struct WhirlApp
     safety_flags::UInt32
     motor_busy::Bool
     last_motor_command_s::Float64
+    lower_plot_mode::Symbol
+    last_fft_update_s::Float64
     angle_axis::Any
     rpm_axis::Any
+    fft_axis::Any
     orbit_axis::Any
+    lower_plot_button::Any
+    rpm_legend::Any
+    fft_legend::Any
     save_path::Any
     target_rpm_box::Any
     profile_menu::Any
@@ -200,7 +213,8 @@ end
 function WhirlApp(host, demo, decimation, window_seconds; capture_directory = CAPTURE_DIRECTORY)
     profile_set = load_motor_profiles()
     motor_profile = profile_by_id(profile_set, profile_set.default_id)
-    plot_capacity = _plot_buffer_capacity(DEFAULT_SAMPLE_RATE, decimation, window_seconds)
+    retention_seconds = max(window_seconds, FFT_WINDOW_SECONDS)
+    plot_capacity = _plot_buffer_capacity(DEFAULT_SAMPLE_RATE, decimation, retention_seconds)
     app = WhirlApp(
         host,
         demo,
@@ -233,12 +247,14 @@ function WhirlApp(host, demo, decimation, window_seconds; capture_directory = CA
         Observable(Point2f[]),
         Observable(Point2f[]),
         Observable(Point2f[]),
+        Observable(Point2f[]),
+        Observable(Point2f[]),
         Observable("Idle"),
         Observable("0 samples"),
         Observable(demo ? "Demo mode — click Start" : "Target: $host"),
         Observable("— RPM"),
         Observable("DISARMED · MANUAL · 0%"),
-        Observable("Target RPM: 0 or $(Int(motor_profile.target_min_rpm))–$(Int(motor_profile.target_max_rpm)) (press Enter)"),
+        Observable("Target: 0 or $(Int(motor_profile.target_min_rpm))–$(Int(motor_profile.target_max_rpm)) RPM · Enter"),
         Observable("Manual: ↑/↓ = one ESC pulse step · Space = STOP"),
         0.0f0,
         0.0f0,
@@ -250,6 +266,12 @@ function WhirlApp(host, demo, decimation, window_seconds; capture_directory = CA
         UInt32(0),
         false,
         -Inf,
+        :rpm,
+        -Inf,
+        nothing,
+        nothing,
+        nothing,
+        nothing,
         nothing,
         nothing,
         nothing,
@@ -302,17 +324,34 @@ function build_figure!(app::WhirlApp)
     )
     lower_plots = GridLayout(; colgap = 18)
     figure[4, 1] = lower_plots
+    speed_panel = GridLayout(; rowgap = 4)
+    lower_plots[1, 1] = speed_panel
     rpm_axis = Axis(
-        lower_plots[1, 1];
+        speed_panel[1, 1];
         title = "Rotor speed",
         xlabel = "Time [s]",
         ylabel = "Speed [RPM]",
     )
+    fft_axis = Axis(
+        speed_panel[1, 1];
+        title = "Angle FFT · trailing 10 s",
+        xlabel = "Frequency [Hz]",
+        ylabel = "Amplitude [deg]",
+    )
+    GLMakie.Makie.hide!(fft_axis)
+    lower_plot_button = Button(
+        speed_panel[2, 1];
+        label = "Show angle FFT",
+        height = 30,
+        width = 150,
+        tellwidth = false,
+    )
+    rowsize!(speed_panel, 2, Fixed(30))
     orbit_axis = Axis(
         lower_plots[1, 2];
         title = "Pitch–yaw orbit (orange = latest)",
-        xlabel = "Pitch [deg]",
-        ylabel = "Yaw [deg]",
+        xlabel = "Yaw [deg]",
+        ylabel = "Pitch [deg]",
         aspect = DataAspect(),
     )
     lines!(angle_axis, app.plot_pitch_points; color = RGBf(0.1, 0.42, 0.9), linewidth = 2, label = "Pitch")
@@ -326,6 +365,8 @@ function build_figure!(app::WhirlApp)
         linestyle = :dash,
         label = "Target",
     )
+    lines!(fft_axis, app.plot_fft_pitch_points; color = RGBf(0.1, 0.42, 0.9), linewidth = 2, label = "Pitch")
+    lines!(fft_axis, app.plot_fft_yaw_points; color = RGBf(0.92, 0.28, 0.32), linewidth = 2, label = "Yaw")
     hlines!(orbit_axis, [0.0]; color = RGBf(0.68, 0.71, 0.76), linewidth = 1, linestyle = :dot)
     vlines!(orbit_axis, [0.0]; color = RGBf(0.68, 0.71, 0.76), linewidth = 1, linestyle = :dot)
     lines!(
@@ -343,11 +384,15 @@ function build_figure!(app::WhirlApp)
         strokewidth = 1.5,
     )
     axislegend(angle_axis; position = :lb, framevisible = false, orientation = :horizontal)
-    axislegend(rpm_axis; position = :lb, framevisible = false, orientation = :horizontal)
+    rpm_legend = axislegend(rpm_axis; position = :lb, framevisible = false, orientation = :horizontal)
+    fft_legend = axislegend(fft_axis; position = :rt, framevisible = false, orientation = :horizontal)
+    GLMakie.Makie.hide!(fft_legend)
     ylims!(angle_axis, -ANGLE_MARGIN_DEGREES, ANGLE_MARGIN_DEGREES)
     ylims!(rpm_axis, 0, 6_500)
     xlims!(angle_axis, 0, app.window_seconds)
     xlims!(rpm_axis, 0, app.window_seconds)
+    xlims!(fft_axis, 0, FFT_MAX_FREQUENCY_HZ)
+    ylims!(fft_axis, 0, FFT_MINIMUM_AMPLITUDE_DEGREES)
     xlims!(orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     ylims!(orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     colsize!(lower_plots, 1, Relative(0.5))
@@ -355,59 +400,66 @@ function build_figure!(app::WhirlApp)
 
     controls = GridLayout(;
         tellwidth = true,
-        width = 330,
+        width = 380,
         valign = :top,
-        rowgap = 8,
+        rowgap = 10,
     )
     figure[3:4, 2] = controls
+    speed_summary = GridLayout(; colgap = 8)
+    controls[1, 1] = speed_summary
     Label(
-        controls[1, 1:2],
+        speed_summary[1, 1],
         "LIVE ROTOR SPEED";
-        fontsize = 14,
+        fontsize = 12,
         font = :bold,
-        halign = :right,
+        halign = :left,
         tellwidth = false,
         color = RGBf(0.32, 0.42, 0.58),
     )
     Label(
-        controls[2, 1:2],
+        speed_summary[1, 2],
         app.rpm_text;
-        fontsize = 32,
+        fontsize = 27,
         font = :bold,
         halign = :right,
         tellwidth = false,
         color = RGBf(0.08, 0.52, 0.36),
     )
-    Label(controls[3, 1:2], "Motor control"; fontsize = 21, font = :bold, halign = :left, tellwidth = false)
-    Label(controls[4, 1:2], "Motor profile"; halign = :left, tellwidth = false, fontsize = 13)
+
+    motor_controls = GridLayout(; colgap = 8, rowgap = 4)
+    controls[2, 1] = motor_controls
+    Label(motor_controls[1, 1:2], "Motor control"; fontsize = 19, font = :bold, halign = :left, tellwidth = false)
+    Label(motor_controls[2, 1:2], "Motor profile"; halign = :left, tellwidth = false, fontsize = 12)
     profile_options = [(profile.label, profile.id) for profile in app.profile_set.profiles]
     profile_menu = Menu(
-        controls[5, 1:2];
+        motor_controls[3, 1:2];
         options = profile_options,
         default = app.motor_profile.label,
-        width = 300,
+        width = 360,
         tellwidth = false,
     )
-    manual_button = Button(controls[6, 1]; label = "Manual", width = 145, tellwidth = false)
-    speed_button = Button(controls[6, 2]; label = "Closed loop", width = 145, tellwidth = false)
+    manual_button = Button(motor_controls[4, 1]; label = "Manual", height = 34, width = 172, tellwidth = false)
+    speed_button = Button(motor_controls[4, 2]; label = "Closed loop", height = 34, width = 172, tellwidth = false)
     Label(
-        controls[7, 1:2],
+        motor_controls[5, 1:2],
         app.target_range_text;
         halign = :left,
         tellwidth = false,
-        fontsize = 13,
+        fontsize = 12,
     )
     target_rpm_box = Textbox(
-        controls[8, 1:2];
+        motor_controls[6, 1:2];
         placeholder = "e.g. 2500",
-        height = 40,
+        height = 34,
+        width = 150,
         tellwidth = false,
         halign = :left,
     )
     arm_button = Button(
-        controls[9, 1];
+        motor_controls[7, 1];
         label = "ARM",
-        width = 145,
+        height = 34,
+        width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.15, 0.67, 0.46),
         buttoncolor_hover = RGBf(0.11, 0.58, 0.39),
@@ -415,9 +467,10 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     stop_button = Button(
-        controls[9, 2];
+        motor_controls[7, 2];
         label = "STOP / DISARM",
-        width = 145,
+        height = 34,
+        width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.76, 0.16, 0.2),
         buttoncolor_hover = RGBf(0.62, 0.1, 0.14),
@@ -425,27 +478,35 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     Label(
-        controls[10, 1:2],
+        motor_controls[8, 1:2],
         app.manual_step_text;
         halign = :left,
         tellwidth = false,
-        fontsize = 13,
+        width = 360,
+        fontsize = 12,
         color = RGBf(0.32, 0.38, 0.48),
+        word_wrap = true,
     )
     Label(
-        controls[11, 1:2],
+        motor_controls[9, 1:2],
         app.motor_text;
         halign = :left,
         tellwidth = false,
+        width = 360,
+        fontsize = 13,
         font = :bold,
         color = RGBf(0.55, 0.12, 0.16),
+        word_wrap = true,
     )
-    Label(controls[12, 1:2], "Acquisition"; fontsize = 18, font = :bold, halign = :left, tellwidth = false)
+
+    acquisition_controls = GridLayout(; colgap = 8, rowgap = 4)
+    controls[3, 1] = acquisition_controls
+    Label(acquisition_controls[1, 1:2], "Acquisition"; fontsize = 18, font = :bold, halign = :left, tellwidth = false)
     start_button = Button(
-        controls[13, 1];
+        acquisition_controls[2, 1];
         label = "Start",
-        height = 42,
-        width = 145,
+        height = 34,
+        width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.15, 0.67, 0.46),
         buttoncolor_hover = RGBf(0.11, 0.58, 0.39),
@@ -453,10 +514,10 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     pause_button = Button(
-        controls[13, 2];
+        acquisition_controls[2, 2];
         label = "Pause + Disarm",
-        height = 42,
-        width = 145,
+        height = 34,
+        width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.96, 0.65, 0.16),
         buttoncolor_hover = RGBf(0.88, 0.55, 0.1),
@@ -464,10 +525,10 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     save_button = Button(
-        controls[14, 1];
+        acquisition_controls[3, 1];
         label = "Save CSV",
-        height = 42,
-        width = 145,
+        height = 34,
+        width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.16, 0.43, 0.78),
         buttoncolor_hover = RGBf(0.12, 0.35, 0.69),
@@ -475,10 +536,10 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     clear_button = Button(
-        controls[14, 2];
+        acquisition_controls[3, 2];
         label = "Clear",
-        height = 42,
-        width = 145,
+        height = 34,
+        width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.76, 0.29, 0.34),
         buttoncolor_hover = RGBf(0.67, 0.22, 0.28),
@@ -486,40 +547,55 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     recover_button = Button(
-        controls[15, 1:2];
+        acquisition_controls[4, 1:2];
         label = "Recover crash files",
-        height = 36,
-        width = 300,
+        height = 30,
+        width = 360,
         tellwidth = false,
     )
-    Label(controls[16, 1:2], "Optional save path (press Enter)"; halign = :left, tellwidth = false, color = RGBf(0.32, 0.38, 0.48))
+    Label(
+        acquisition_controls[5, 1:2],
+        "Optional save path (press Enter)";
+        halign = :left,
+        tellwidth = false,
+        fontsize = 12,
+        color = RGBf(0.32, 0.38, 0.48),
+    )
     save_path = Textbox(
-        controls[17, 1:2];
+        acquisition_controls[6, 1:2];
         placeholder = "auto: captures/whirl_*.csv",
-        height = 42,
+        height = 34,
         tellwidth = false,
         halign = :left,
     )
-    Label(controls[18, 1:2], app.status_text; fontsize = 18, font = :bold, halign = :left, tellwidth = false)
-    Label(controls[19, 1:2], app.stats_text; halign = :left, tellwidth = false, color = RGBf(0.25, 0.32, 0.43))
+
+    status_controls = GridLayout(; rowgap = 4)
+    controls[4, 1] = status_controls
+    Label(status_controls[1, 1], app.status_text; fontsize = 17, font = :bold, halign = :left, tellwidth = false)
+    Label(status_controls[2, 1], app.stats_text; fontsize = 12, halign = :left, tellwidth = false, color = RGBf(0.25, 0.32, 0.43))
     Label(
-        controls[20, 1:2],
+        status_controls[3, 1],
         app.info_text;
         halign = :left,
         tellwidth = false,
-        width = 315,
+        width = 360,
+        fontsize = 12,
         color = RGBf(0.25, 0.32, 0.43),
         justification = :left,
         word_wrap = true,
     )
-    colsize!(figure.layout, 1, Relative(0.78))
-    colsize!(figure.layout, 2, Fixed(340))
+    colsize!(figure.layout, 1, Relative(0.74))
+    colsize!(figure.layout, 2, Fixed(400))
     rowsize!(figure.layout, 3, Relative(0.5))
     rowsize!(figure.layout, 4, Relative(0.5))
 
     app.angle_axis = angle_axis
     app.rpm_axis = rpm_axis
+    app.fft_axis = fft_axis
     app.orbit_axis = orbit_axis
+    app.lower_plot_button = lower_plot_button
+    app.rpm_legend = rpm_legend
+    app.fft_legend = fft_legend
     app.save_path = save_path
     app.target_rpm_box = target_rpm_box
     app.profile_menu = profile_menu
@@ -539,6 +615,11 @@ function build_figure!(app::WhirlApp)
     end
     on(clear_button.clicks) do _
         clear_data!(app)
+        return nothing
+    end
+    on(lower_plot_button.clicks) do _
+        mode = app.lower_plot_mode == :rpm ? :fft : :rpm
+        set_lower_plot_mode!(app, mode)
         return nothing
     end
     on(recover_button.clicks) do _
@@ -624,6 +705,139 @@ function _rpm_plot_limits(rpm)
     return max(0.0, value - RPM_MARGIN), value + RPM_MARGIN
 end
 
+function _interpolated_angle_window(
+        buffer::PlotRingBuffer,
+        sample_rate::Real,
+        decimation::Integer;
+        window_seconds::Real = FFT_WINDOW_SECONDS,
+    )
+    sample_rate > 0 || throw(ArgumentError("sample rate must be positive"))
+    decimation > 0 || throw(ArgumentError("decimation must be positive"))
+    window_seconds > 0 || throw(ArgumentError("FFT window must be positive"))
+    length(buffer) >= 2 || return (pitch = Float64[], yaw = Float64[], sample_rate = 0.0)
+
+    effective_rate = Float64(sample_rate) / decimation
+    latest_time = buffer[end].time_s
+    earliest_index = _plot_searchsortedfirst(buffer, latest_time - window_seconds)
+    available_duration = latest_time - buffer[earliest_index].time_s
+    sample_count = min(
+        round(Int, window_seconds * effective_rate),
+        floor(Int, available_duration * effective_rate) + 1,
+    )
+    sample_count >= 4 || return (pitch = Float64[], yaw = Float64[], sample_rate = effective_rate)
+
+    first_time = latest_time - (sample_count - 1) / effective_rate
+    source_index = max(1, _plot_searchsortedfirst(buffer, first_time) - 1)
+    pitch = Vector{Float64}(undef, sample_count)
+    yaw = Vector{Float64}(undef, sample_count)
+    for output_index in 1:sample_count
+        sample_time = first_time + (output_index - 1) / effective_rate
+        while source_index < length(buffer) && buffer[source_index + 1].time_s < sample_time
+            source_index += 1
+        end
+        lower = buffer[source_index]
+        if source_index == length(buffer)
+            pitch[output_index] = lower.pitch_degrees
+            yaw[output_index] = lower.yaw_degrees
+            continue
+        end
+        upper = buffer[source_index + 1]
+        interval = upper.time_s - lower.time_s
+        fraction = iszero(interval) ? 0.0 : clamp((sample_time - lower.time_s) / interval, 0.0, 1.0)
+        pitch[output_index] = lower.pitch_degrees + fraction * (upper.pitch_degrees - lower.pitch_degrees)
+        yaw[output_index] = lower.yaw_degrees + fraction * (upper.yaw_degrees - lower.yaw_degrees)
+    end
+    return (; pitch, yaw, sample_rate = effective_rate)
+end
+
+function _amplitude_spectrum(
+        values::AbstractVector,
+        sample_rate::Real;
+        max_frequency::Real = FFT_MAX_FREQUENCY_HZ,
+    )
+    sample_rate > 0 || throw(ArgumentError("sample rate must be positive"))
+    max_frequency > 0 || throw(ArgumentError("maximum frequency must be positive"))
+    sample_count = length(values)
+    sample_count >= 4 || return (frequency_hz = Float64[], amplitude = Float64[])
+
+    average = sum(values) / sample_count
+    windowed = Vector{Float64}(undef, sample_count)
+    window_sum = 0.0
+    for index in eachindex(values)
+        window = 0.5 - 0.5 * cospi(2 * (index - 1) / (sample_count - 1))
+        windowed[index] = (Float64(values[index]) - average) * window
+        window_sum += window
+    end
+    transform = rfft(windowed)
+    amplitude = 2 .* abs.(transform) ./ window_sum
+    iseven(sample_count) && (amplitude[end] /= 2)
+    frequency_hz = collect((0:(length(transform) - 1)) .* (Float64(sample_rate) / sample_count))
+    last_bin = searchsortedlast(frequency_hz, min(Float64(max_frequency), Float64(sample_rate) / 2))
+    last_bin >= 2 || return (frequency_hz = Float64[], amplitude = Float64[])
+    return (
+        frequency_hz = frequency_hz[2:last_bin],
+        amplitude = amplitude[2:last_bin],
+    )
+end
+
+function update_fft!(app::WhirlApp; force::Bool = false)
+    app.lower_plot_mode == :fft || return nothing
+    current_time = time()
+    !force && current_time - app.last_fft_update_s < FFT_REFRESH_SECONDS && return nothing
+    app.last_fft_update_s = current_time
+    inputs = _interpolated_angle_window(
+        app.plot_buffer,
+        app.sample_rate,
+        app.decimation,
+    )
+    if length(inputs.pitch) < 4
+        app.plot_fft_pitch_points[] = Point2f[]
+        app.plot_fft_yaw_points[] = Point2f[]
+        ylims!(app.fft_axis, 0, FFT_MINIMUM_AMPLITUDE_DEGREES)
+        xlims!(app.fft_axis, 0, FFT_MAX_FREQUENCY_HZ)
+        return nothing
+    end
+    pitch_spectrum = _amplitude_spectrum(inputs.pitch, inputs.sample_rate)
+    yaw_spectrum = _amplitude_spectrum(inputs.yaw, inputs.sample_rate)
+    app.plot_fft_pitch_points[] = Point2f.(
+        pitch_spectrum.frequency_hz,
+        pitch_spectrum.amplitude,
+    )
+    app.plot_fft_yaw_points[] = Point2f.(
+        yaw_spectrum.frequency_hz,
+        yaw_spectrum.amplitude,
+    )
+    maximum_amplitude = max(
+        maximum(pitch_spectrum.amplitude; init = 0.0),
+        maximum(yaw_spectrum.amplitude; init = 0.0),
+    )
+    upper = max(FFT_MINIMUM_AMPLITUDE_DEGREES, 1.1 * maximum_amplitude)
+    ylims!(app.fft_axis, 0, upper)
+    xlims!(app.fft_axis, 0, min(FFT_MAX_FREQUENCY_HZ, inputs.sample_rate / 2))
+    return nothing
+end
+
+function set_lower_plot_mode!(app::WhirlApp, mode::Symbol)
+    mode in (:rpm, :fft) || throw(ArgumentError("lower plot mode must be :rpm or :fft"))
+    app.lower_plot_mode = mode
+    if mode == :fft
+        GLMakie.Makie.hide!(app.rpm_axis)
+        GLMakie.Makie.hide!(app.rpm_legend)
+        GLMakie.Makie.unhide!(app.fft_axis)
+        GLMakie.Makie.unhide!(app.fft_legend)
+        app.lower_plot_button.label[] = "Show rotor speed"
+        app.last_fft_update_s = -Inf
+        update_fft!(app; force = true)
+    else
+        GLMakie.Makie.hide!(app.fft_axis)
+        GLMakie.Makie.hide!(app.fft_legend)
+        GLMakie.Makie.unhide!(app.rpm_axis)
+        GLMakie.Makie.unhide!(app.rpm_legend)
+        app.lower_plot_button.label[] = "Show angle FFT"
+    end
+    return nothing
+end
+
 function _motor_device_available(app::WhirlApp)
     return !isnothing(app.device) && isopen(app.device)
 end
@@ -662,7 +876,7 @@ end
 function _update_profile_text!(app::WhirlApp)
     profile = app.motor_profile
     app.target_range_text[] =
-        "Target RPM: 0 or $(Int(profile.target_min_rpm))–$(Int(profile.target_max_rpm)) (press Enter)"
+        "Target: 0 or $(Int(profile.target_min_rpm))–$(Int(profile.target_max_rpm)) RPM · Enter"
     pulse_step_us =
         profile.manual_step_throttle * (profile.esc_max_pulse_us - profile.esc_min_pulse_us)
     app.manual_step_text[] =
@@ -1104,7 +1318,11 @@ function start_receiving!(app::WhirlApp)
         app.sample_rate = Float64(device_status.sample_rate)
         _resize_plot_buffer!(
             app.plot_buffer,
-            _plot_buffer_capacity(app.sample_rate, app.decimation, app.window_seconds),
+            _plot_buffer_capacity(
+                app.sample_rate,
+                app.decimation,
+                max(app.window_seconds, FFT_WINDOW_SECONDS),
+            ),
         )
         configure_stream!(app.device, WHIRL_SOURCES; decimation = app.decimation, count = 0)
         receiver = HelicDAQ.StreamReceiver(; port = 0, timeout = STREAM_TIMEOUT_SECONDS)
@@ -1310,11 +1528,16 @@ function clear_data!(app::WhirlApp)
     app.plot_yaw_points[] = Point2f[]
     app.plot_rpm_points[] = Point2f[]
     app.plot_target_points[] = Point2f[]
+    app.plot_fft_pitch_points[] = Point2f[]
+    app.plot_fft_yaw_points[] = Point2f[]
     app.plot_orbit_points[] = Point2f[]
     app.plot_orbit_current[] = Point2f[]
+    app.last_fft_update_s = -Inf
     app.rpm_text[] = "— RPM"
     ylims!(app.angle_axis, -ANGLE_MARGIN_DEGREES, ANGLE_MARGIN_DEGREES)
     ylims!(app.rpm_axis, 0, 6_500)
+    xlims!(app.fft_axis, 0, FFT_MAX_FREQUENCY_HZ)
+    ylims!(app.fft_axis, 0, FFT_MINIMUM_AMPLITUDE_DEGREES)
     xlims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     ylims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     app.status_text[] = app.running ? app.status_text[] : "Idle"
@@ -1632,7 +1855,7 @@ function update_plots!(app::WhirlApp)
         plot_yaw_points[output_index] = Point2f(sample.time_s, sample.yaw_degrees)
         plot_rpm_points[output_index] = Point2f(sample.time_s, sample.rpm)
         plot_target_points[output_index] = Point2f(sample.time_s, sample.rpm_target)
-        plot_orbit_points[output_index] = Point2f(sample.pitch_degrees, sample.yaw_degrees)
+        plot_orbit_points[output_index] = Point2f(sample.yaw_degrees, sample.pitch_degrees)
     end
     # A single point-vector observable keeps x/y lengths atomic for GLMakie's
     # asynchronous renderer and avoids the mismatch storm caused by separate
@@ -1643,7 +1866,7 @@ function update_plots!(app::WhirlApp)
     app.plot_rpm_points[] = plot_rpm_points
     app.plot_target_points[] = plot_target_points
     app.plot_orbit_points[] = plot_orbit_points
-    app.plot_orbit_current[] = Point2f[(latest.pitch_degrees, latest.yaw_degrees)]
+    app.plot_orbit_current[] = Point2f[(latest.yaw_degrees, latest.pitch_degrees)]
     _update_motor_text!(app)
     absolute_maximum = 0.0f0
     for index in first_visible:length(app.plot_buffer)
@@ -1668,6 +1891,7 @@ function update_plots!(app::WhirlApp)
     left = max(0.0, right - app.window_seconds)
     xlims!(app.angle_axis, left, right)
     xlims!(app.rpm_axis, left, right)
+    update_fft!(app)
     return nothing
 end
 
