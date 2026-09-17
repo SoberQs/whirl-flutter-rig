@@ -1,7 +1,7 @@
 # Host operating profiles constrained by the firmware's independent safety limits.
 
-schema_version = 1
-default_profile = "mn2806_kv400_air40a_16v5"
+schema_version = 2
+default_profile = "cine66_kv925_air40a_25v_prop8x6"
 
 [[profiles]]
 id = "mn2806_kv400_air40a_16v5"
@@ -18,6 +18,7 @@ tested_supply_v = 16.5
 target_min_rpm = 2000.0
 target_max_rpm = 6000.0
 manual_max_throttle = 0.90
+manual_step_throttle = 0.01
 
 kp = 0.00016666667
 ki = 0.00005
@@ -30,3 +31,77 @@ esc_min_pulse_us = 1100
 esc_max_pulse_us = 1940
 esc_calibration_status = "Factory-default endpoints accepted; full travel not independently calibrated"
 hardware_evidence = "16.5 V supply; manual 5–20%; closed-loop 2000–3000 RPM; 2026-08-24"
+
+[[profiles]]
+id = "cine66_kv925_air40a_25v"
+label = "CINE66 KV925 · AIR 40A · 25 V · no prop"
+motor_model = "T-Motor CINE66 KV925"
+motor_kv = 925.0
+supply_cells_min = 5
+supply_cells_max = 6
+tested_supply_v = 25.0
+
+# This envelope is specific to the unloaded 25 V hardware evidence below.
+# With no propeller, the ESC has a large start/run hysteresis: it first starts
+# near 4.5% but can continue below that command. The 6000 RPM profile ceiling
+# remains below the firmware's independent 6500 RPM trip.
+target_min_rpm = 4000.0
+target_max_rpm = 6000.0
+manual_max_throttle = 0.90
+
+# One 1 us step across the 1100–1940 us ESC span. Smaller normalised steps can
+# round back to the same physical pulse and do not provide finer actuation.
+manual_step_throttle = 0.0011904762
+
+kp = 0.00003
+ki = 0.000003
+ramp_per_s = 0.02
+
+# These describe the currently flashed firmware. Its 15% feedback threshold
+# is above this no-prop operating envelope and therefore still requires a
+# firmware safety-profile revision before feedback-loss testing is complete.
+feedback_timeout_s = 2.0
+feedback_required_above = 0.15
+
+esc_pwm_hz = 50
+esc_min_pulse_us = 1100
+esc_max_pulse_us = 1940
+esc_calibration_status = "Existing AIR 40A endpoints retained after motor-only replacement"
+hardware_evidence = "25 V, no propeller; manual 0–5.48% / 0–1146 us; closed-loop 4000, 5000, and 6000 RPM; 2026-09-11"
+
+[[profiles]]
+id = "cine66_kv925_air40a_25v_prop8x6"
+label = "CINE66 KV925 · AIR 40A · 25 V · 8×6 prop"
+motor_model = "T-Motor CINE66 KV925"
+motor_kv = 925.0
+supply_cells_min = 5
+supply_cells_max = 6
+tested_supply_v = 25.0
+
+# This envelope is specific to the fitted 8×6 propeller in still air. The
+# firmware independently clamps targets to 6000 RPM and trips above 6500 RPM.
+target_min_rpm = 2000.0
+target_max_rpm = 6000.0
+
+# 194 us above the 1100 us minimum is the highest manually evidenced command.
+manual_max_throttle = 0.23095238
+
+# One 1 us step across the 1100–1940 us ESC span. This preserves fine manual
+# control despite the much wider loaded throttle range.
+manual_step_throttle = 0.0011904762
+
+kp = 0.0001
+ki = 0.00003
+ramp_per_s = 0.10
+
+# These describe the currently flashed firmware. The 15% threshold protects
+# the upper part of the range only; low-speed feedback-loss testing therefore
+# remains outstanding.
+feedback_timeout_s = 2.0
+feedback_required_above = 0.15
+
+esc_pwm_hz = 50
+esc_min_pulse_us = 1100
+esc_max_pulse_us = 1940
+esc_calibration_status = "Existing AIR 40A endpoints retained after adding the propeller"
+hardware_evidence = "25 V, 8×6 propeller in still air; manual 1130–1294 us / 2020–6012 RPM; closed-loop 2000, 4000, and 6000 RPM; 2026-09-17"

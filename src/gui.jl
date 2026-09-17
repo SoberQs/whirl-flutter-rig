@@ -20,8 +20,12 @@ const WHIRL_SOURCES = (
     :ctrl_saturated,
     :esc_throttle,
 )
+const DEFAULT_SAMPLE_RATE = 2_000.0
 const MAX_PLOT_POINTS = 2_000
 const PLOT_REFRESH_SECONDS = 0.025
+const CAPTURE_FLUSH_SECONDS = 1.0
+const CAPTURE_DIRECTORY = normpath(joinpath(@__DIR__, "..", "captures"))
+const CAPTURE_HEADER = "time_s,sample_index,pitch_deg,yaw_deg,rpm,rpm_target,esc_throttle,ctrl_saturated"
 const STREAM_TIMEOUT_SECONDS = 5.0
 const MAX_STREAM_RESTARTS = 3
 const CONTROL_STATE_POLL_SECONDS = 0.5
@@ -30,6 +34,110 @@ const ORBIT_MINIMUM_EXTENT_DEGREES = 1.0
 const ORBIT_MARGIN_FRACTION = 0.1
 const RPM_MARGIN = 1_000.0
 const MOTOR_COMMAND_INTERVAL_SECONDS = 0.05
+
+mutable struct CaptureWriter
+    partial_path::String
+    final_path::String
+    io::IOStream
+    row_count::UInt64
+    last_flush_ns::UInt64
+end
+
+struct CaptureError <: Exception
+    message::String
+end
+
+Base.showerror(io::IO, error::CaptureError) = print(io, error.message)
+
+struct PlotSample
+    time_s::Float64
+    pitch_degrees::Float32
+    yaw_degrees::Float32
+    rpm::Float32
+    rpm_target::Float32
+    ctrl_saturated::Float32
+    esc_throttle::Float32
+end
+
+mutable struct PlotRingBuffer
+    storage::Vector{PlotSample}
+    first::Int
+    count::Int
+end
+
+function PlotRingBuffer(capacity::Integer)
+    capacity > 0 || throw(ArgumentError("plot buffer capacity must be positive"))
+    return PlotRingBuffer(Vector{PlotSample}(undef, capacity), 1, 0)
+end
+
+Base.length(buffer::PlotRingBuffer) = buffer.count
+Base.isempty(buffer::PlotRingBuffer) = iszero(buffer.count)
+Base.firstindex(::PlotRingBuffer) = 1
+Base.lastindex(buffer::PlotRingBuffer) = length(buffer)
+
+function Base.getindex(buffer::PlotRingBuffer, index::Integer)
+    @boundscheck checkbounds(1:buffer.count, index)
+    physical = mod1(buffer.first + index - 1, length(buffer.storage))
+    return @inbounds buffer.storage[physical]
+end
+
+function Base.push!(buffer::PlotRingBuffer, sample::PlotSample)
+    capacity = length(buffer.storage)
+    if buffer.count < capacity
+        physical = mod1(buffer.first + buffer.count, capacity)
+        buffer.count += 1
+    else
+        physical = buffer.first
+        buffer.first = mod1(buffer.first + 1, capacity)
+    end
+    @inbounds buffer.storage[physical] = sample
+    return buffer
+end
+
+function Base.empty!(buffer::PlotRingBuffer)
+    buffer.first = 1
+    buffer.count = 0
+    return buffer
+end
+
+function _plot_buffer_capacity(sample_rate::Real, decimation::Integer, window_seconds::Real)
+    sample_rate > 0 || throw(ArgumentError("sample rate must be positive"))
+    decimation > 0 || throw(ArgumentError("decimation must be positive"))
+    window_seconds > 0 || throw(ArgumentError("plot window must be positive"))
+    samples = Float64(sample_rate) * Float64(window_seconds) / decimation
+    isfinite(samples) && samples < typemax(Int) ||
+        throw(ArgumentError("plot buffer capacity does not fit an Int"))
+    return max(2, ceil(Int, samples) + 1)
+end
+
+function _resize_plot_buffer!(buffer::PlotRingBuffer, capacity::Integer)
+    capacity > 0 || throw(ArgumentError("plot buffer capacity must be positive"))
+    capacity == length(buffer.storage) && return buffer
+    retained = min(buffer.count, capacity)
+    first_retained = buffer.count - retained + 1
+    storage = Vector{PlotSample}(undef, capacity)
+    for index in 1:retained
+        storage[index] = buffer[first_retained + index - 1]
+    end
+    buffer.storage = storage
+    buffer.first = 1
+    buffer.count = retained
+    return buffer
+end
+
+function _plot_searchsortedfirst(buffer::PlotRingBuffer, time_s::Real)
+    lower = 1
+    upper = length(buffer) + 1
+    while lower < upper
+        middle = (lower + upper) >>> 1
+        if middle <= length(buffer) && buffer[middle].time_s < time_s
+            lower = middle + 1
+        else
+            upper = middle
+        end
+    end
+    return lower
+end
 
 mutable struct WhirlApp
     host::String
@@ -42,14 +150,11 @@ mutable struct WhirlApp
     session::UInt64
     device::Union{Nothing, HelicDAQ.Device}
     receiver::Union{Nothing, HelicDAQ.StreamReceiver}
-    times::Vector{Float64}
-    sample_indices::Vector{UInt64}
-    pitch_degrees::Vector{Float32}
-    yaw_degrees::Vector{Float32}
-    rpm::Vector{Float32}
-    rpm_target::Vector{Float32}
-    ctrl_saturated::Vector{Float32}
-    esc_throttle::Vector{Float32}
+    capture_directory::String
+    capture::Union{Nothing, CaptureWriter}
+    capture_lock::ReentrantLock
+    total_samples::UInt64
+    latest_ctrl_saturated::Float32
     pitch_zero_degrees::Union{Nothing, Float32}
     yaw_zero_degrees::Union{Nothing, Float32}
     first_index::Union{Nothing, UInt64}
@@ -58,6 +163,7 @@ mutable struct WhirlApp
     demo_index::UInt64
     dropped::UInt32
     lost_packets::Int
+    plot_buffer::PlotRingBuffer
     plot_time::Observable{Vector{Float64}}
     plot_pitch_points::Observable{Vector{Point2f}}
     plot_yaw_points::Observable{Vector{Point2f}}
@@ -71,6 +177,7 @@ mutable struct WhirlApp
     rpm_text::Observable{String}
     motor_text::Observable{String}
     target_range_text::Observable{String}
+    manual_step_text::Observable{String}
     manual_throttle::Float32
     target_rpm::Float32
     motor_mode::Symbol
@@ -90,28 +197,26 @@ mutable struct WhirlApp
     figure::Any
 end
 
-function WhirlApp(host, demo, decimation, window_seconds)
+function WhirlApp(host, demo, decimation, window_seconds; capture_directory = CAPTURE_DIRECTORY)
     profile_set = load_motor_profiles()
     motor_profile = profile_by_id(profile_set, profile_set.default_id)
-    return WhirlApp(
+    plot_capacity = _plot_buffer_capacity(DEFAULT_SAMPLE_RATE, decimation, window_seconds)
+    app = WhirlApp(
         host,
         demo,
         decimation,
         window_seconds,
-        2_000.0,
+        DEFAULT_SAMPLE_RATE,
         false,
         false,
         UInt64(0),
         nothing,
         nothing,
-        Float64[],
-        UInt64[],
-        Float32[],
-        Float32[],
-        Float32[],
-        Float32[],
-        Float32[],
-        Float32[],
+        abspath(capture_directory),
+        nothing,
+        ReentrantLock(),
+        UInt64(0),
+        0.0f0,
         nothing,
         nothing,
         nothing,
@@ -120,6 +225,7 @@ function WhirlApp(host, demo, decimation, window_seconds)
         UInt64(0),
         UInt32(0),
         0,
+        PlotRingBuffer(plot_capacity),
         Observable(Float64[]),
         Observable(Point2f[]),
         Observable(Point2f[]),
@@ -133,6 +239,7 @@ function WhirlApp(host, demo, decimation, window_seconds)
         Observable("— RPM"),
         Observable("DISARMED · MANUAL · 0%"),
         Observable("Target RPM: 0 or $(Int(motor_profile.target_min_rpm))–$(Int(motor_profile.target_max_rpm)) (press Enter)"),
+        Observable("Manual: ↑/↓ = one ESC pulse step · Space = STOP"),
         0.0f0,
         0.0f0,
         :manual,
@@ -151,6 +258,8 @@ function WhirlApp(host, demo, decimation, window_seconds)
         nothing,
         nothing,
     )
+    _update_profile_text!(app)
+    return app
 end
 
 function build_figure!(app::WhirlApp)
@@ -317,7 +426,7 @@ function build_figure!(app::WhirlApp)
     )
     Label(
         controls[10, 1:2],
-        "Manual: ↑/↓ = ±1% · Space = STOP";
+        app.manual_step_text;
         halign = :left,
         tellwidth = false,
         fontsize = 13,
@@ -376,18 +485,25 @@ function build_figure!(app::WhirlApp)
         labelcolor = :white,
         labelcolor_hover = :white,
     )
-    Label(controls[15, 1:2], "Optional save path (press Enter)"; halign = :left, tellwidth = false, color = RGBf(0.32, 0.38, 0.48))
+    recover_button = Button(
+        controls[15, 1:2];
+        label = "Recover crash files",
+        height = 36,
+        width = 300,
+        tellwidth = false,
+    )
+    Label(controls[16, 1:2], "Optional save path (press Enter)"; halign = :left, tellwidth = false, color = RGBf(0.32, 0.38, 0.48))
     save_path = Textbox(
-        controls[16, 1:2];
+        controls[17, 1:2];
         placeholder = "auto: captures/whirl_*.csv",
         height = 42,
         tellwidth = false,
         halign = :left,
     )
-    Label(controls[17, 1:2], app.status_text; fontsize = 18, font = :bold, halign = :left, tellwidth = false)
-    Label(controls[18, 1:2], app.stats_text; halign = :left, tellwidth = false, color = RGBf(0.25, 0.32, 0.43))
+    Label(controls[18, 1:2], app.status_text; fontsize = 18, font = :bold, halign = :left, tellwidth = false)
+    Label(controls[19, 1:2], app.stats_text; halign = :left, tellwidth = false, color = RGBf(0.25, 0.32, 0.43))
     Label(
-        controls[19, 1:2],
+        controls[20, 1:2],
         app.info_text;
         halign = :left,
         tellwidth = false,
@@ -423,6 +539,10 @@ function build_figure!(app::WhirlApp)
     end
     on(clear_button.clicks) do _
         clear_data!(app)
+        return nothing
+    end
+    on(recover_button.clicks) do _
+        @async recover_partial_captures!(app)
         return nothing
     end
     on(profile_menu.selection) do profile_id
@@ -524,20 +644,29 @@ function _update_motor_text!(app::WhirlApp)
     safety = app.tripped ? "TRIPPED" : (app.armed ? "ARMED" : "DISARMED")
     mode = app.motor_mode == :manual ? "MANUAL" : "CLOSED LOOP"
     command = if app.motor_mode == :manual
-        @sprintf("%.0f%%", 100 * app.manual_throttle)
+        _format_throttle(app.manual_throttle, app.motor_profile)
     else
         @sprintf("%.0f RPM", app.target_rpm)
     end
-    saturated = !isempty(app.ctrl_saturated) && app.ctrl_saturated[end] != 0.0f0
+    saturated = app.latest_ctrl_saturated != 0.0f0
     suffix = saturated && !app.tripped ? " · SATURATED / TARGET MAY BE UNREACHABLE" : ""
     app.motor_text[] = "$safety · $mode · $command$suffix"
     return nothing
+end
+
+function _format_throttle(throttle::Real, profile::MotorProfile)
+    digits = profile.manual_step_throttle < 0.005 ? 2 : 0
+    return @sprintf("%.*f%%", digits, 100 * throttle)
 end
 
 function _update_profile_text!(app::WhirlApp)
     profile = app.motor_profile
     app.target_range_text[] =
         "Target RPM: 0 or $(Int(profile.target_min_rpm))–$(Int(profile.target_max_rpm)) (press Enter)"
+    pulse_step_us =
+        profile.manual_step_throttle * (profile.esc_max_pulse_us - profile.esc_min_pulse_us)
+    app.manual_step_text[] =
+        "Manual: ↑/↓ = ±$(_format_throttle(profile.manual_step_throttle, profile)) (≈$(@sprintf("%.1f", pulse_step_us)) µs) · Space = STOP"
     return nothing
 end
 
@@ -634,7 +763,7 @@ function select_motor_profile!(app::WhirlApp, profile_id::AbstractString)
         _update_profile_text!(app)
         _restore_normal_status!(app)
         app.info_text[] =
-            "Profile $(profile.label) applied; configured manual limit $(Int(round(100 * profile.manual_max_throttle)))%, RPM range $(Int(profile.target_min_rpm))–$(Int(profile.target_max_rpm))"
+            "Profile $(profile.label) applied; manual limit $(_format_throttle(profile.manual_max_throttle, profile)), step $(_format_throttle(profile.manual_step_throttle, profile)), RPM range $(Int(profile.target_min_rpm))–$(Int(profile.target_max_rpm))"
     catch error
         if !isnothing(app.profile_menu)
             previous_index = findfirst(
@@ -753,12 +882,13 @@ function adjust_manual_throttle!(app::WhirlApp, direction::Integer)
     next_throttle = manual_step(
         app.manual_throttle,
         direction;
+        step = app.motor_profile.manual_step_throttle,
         upper = app.motor_profile.manual_max_throttle,
     )
     try
         !app.demo && (app.device[:ctrl_manual] = next_throttle)
         app.manual_throttle = next_throttle
-        app.info_text[] = @sprintf("Manual throttle %.0f%%", 100 * next_throttle)
+        app.info_text[] = "Manual throttle $(_format_throttle(next_throttle, app.motor_profile))"
     catch error
         app.status_text[] = "Motor command error"
         app.info_text[] = sprint(showerror, error)
@@ -804,24 +934,71 @@ function emergency_stop!(app::WhirlApp; report::Bool = true)
     return nothing
 end
 
+function _append_sample_locked!(app::WhirlApp, sample_index::UInt64, sample::PlotSample)
+    if !isnothing(app.capture)
+        writer = app.capture
+        try
+            println(
+                writer.io,
+                sample.time_s,
+                ',',
+                sample_index,
+                ',',
+                sample.pitch_degrees,
+                ',',
+                sample.yaw_degrees,
+                ',',
+                sample.rpm,
+                ',',
+                sample.rpm_target,
+                ',',
+                sample.esc_throttle,
+                ',',
+                sample.ctrl_saturated,
+            )
+            writer.row_count += 1
+            current_ns = UInt64(time_ns())
+            flush_interval_ns = UInt64(round(CAPTURE_FLUSH_SECONDS * 1.0e9))
+            if current_ns - writer.last_flush_ns >= flush_interval_ns
+                flush(writer.io)
+                writer.last_flush_ns = current_ns
+            end
+        catch error
+            throw(CaptureError("could not append to $(writer.partial_path): $(sprint(showerror, error))"))
+        end
+    end
+    push!(app.plot_buffer, sample)
+    app.total_samples += 1
+    app.latest_ctrl_saturated = sample.ctrl_saturated
+    return nothing
+end
+
 function append_packet!(app::WhirlApp, header, values)
     size(values, 2) == length(WHIRL_SOURCES) ||
         throw(ArgumentError("expected $(length(WHIRL_SOURCES)) whirl sources, received $(size(values, 2))"))
-    for row in axes(values, 1)
-        offset = UInt32(mod(UInt64(row - 1) * UInt64(header.decimation), UInt64(1) << 32))
-        extended = _record_index!(app, header.first_index + offset)
-        pitch = 360.0f0 * values[row, 1]
-        yaw = 360.0f0 * values[row, 2]
-        isnothing(app.pitch_zero_degrees) && (app.pitch_zero_degrees = pitch)
-        isnothing(app.yaw_zero_degrees) && (app.yaw_zero_degrees = yaw)
-        push!(app.sample_indices, extended)
-        push!(app.times, (extended - app.first_index) / app.sample_rate)
-        push!(app.pitch_degrees, _zero_relative_angle(pitch, app.pitch_zero_degrees))
-        push!(app.yaw_degrees, _zero_relative_angle(yaw, app.yaw_zero_degrees))
-        push!(app.rpm, values[row, 3])
-        push!(app.rpm_target, values[row, 4])
-        push!(app.ctrl_saturated, values[row, 5])
-        push!(app.esc_throttle, values[row, 6])
+    lock(app.capture_lock) do
+        for row in axes(values, 1)
+            offset = UInt32(mod(UInt64(row - 1) * UInt64(header.decimation), UInt64(1) << 32))
+            extended = _record_index!(app, header.first_index + offset)
+            pitch = 360.0f0 * values[row, 1]
+            yaw = 360.0f0 * values[row, 2]
+            isnothing(app.pitch_zero_degrees) && (app.pitch_zero_degrees = pitch)
+            isnothing(app.yaw_zero_degrees) && (app.yaw_zero_degrees = yaw)
+            time_s = (extended - app.first_index) / app.sample_rate
+            _append_sample_locked!(
+                app,
+                extended,
+                PlotSample(
+                    time_s,
+                    _zero_relative_angle(pitch, app.pitch_zero_degrees),
+                    _zero_relative_angle(yaw, app.yaw_zero_degrees),
+                    values[row, 3],
+                    values[row, 4],
+                    values[row, 5],
+                    values[row, 6],
+                ),
+            )
+        end
     end
     app.dropped = header.dropped
     isnothing(app.receiver) || (app.lost_packets = app.receiver.lost_packets)
@@ -830,31 +1007,38 @@ end
 
 function append_demo_chunk!(app::WhirlApp)
     count = max(1, round(Int, 0.02 * app.sample_rate / app.decimation))
-    for _ in 1:count
-        index = app.demo_index
-        time_s = index / app.sample_rate
-        # Ramp away from the sampled zero before settling into a slightly
-        # distorted ellipse, so demo mode exercises the orbit display.
-        envelope = min(1.0, time_s / 0.5)
-        pitch = 45 + 3.2 * envelope * sinpi(4 * time_s)
-        yaw = 120 + envelope * (2.2 * sinpi(4 * time_s + 0.55) + 0.35 * sinpi(8 * time_s))
-        target = app.motor_mode == :speed && app.armed ? app.target_rpm : 0.0f0
-        speed = target > 0 ? target + 120 * sinpi(1.7 * time_s) : 0.0
-        throttle = app.armed ? app.manual_throttle : 0.0f0
-        if app.motor_mode == :speed && app.armed
-            throttle = clamp(target / 6_000, 0, 1)
+    lock(app.capture_lock) do
+        for _ in 1:count
+            index = app.demo_index
+            time_s = index / app.sample_rate
+            # Ramp away from the sampled zero before settling into a slightly
+            # distorted ellipse, so demo mode exercises the orbit display.
+            envelope = min(1.0, time_s / 0.5)
+            pitch = 45 + 3.2 * envelope * sinpi(4 * time_s)
+            yaw = 120 + envelope * (2.2 * sinpi(4 * time_s + 0.55) + 0.35 * sinpi(8 * time_s))
+            target = app.motor_mode == :speed && app.armed ? app.target_rpm : 0.0f0
+            speed = target > 0 ? target + 120 * sinpi(1.7 * time_s) : 0.0
+            throttle = app.armed ? app.manual_throttle : 0.0f0
+            if app.motor_mode == :speed && app.armed
+                throttle = clamp(target / 6_000, 0, 1)
+            end
+            isnothing(app.pitch_zero_degrees) && (app.pitch_zero_degrees = Float32(pitch))
+            isnothing(app.yaw_zero_degrees) && (app.yaw_zero_degrees = Float32(yaw))
+            _append_sample_locked!(
+                app,
+                index,
+                PlotSample(
+                    time_s,
+                    _zero_relative_angle(Float32(pitch), app.pitch_zero_degrees),
+                    _zero_relative_angle(Float32(yaw), app.yaw_zero_degrees),
+                    Float32(speed),
+                    Float32(target),
+                    0.0f0,
+                    Float32(throttle),
+                ),
+            )
+            app.demo_index += UInt64(app.decimation)
         end
-        isnothing(app.pitch_zero_degrees) && (app.pitch_zero_degrees = Float32(pitch))
-        isnothing(app.yaw_zero_degrees) && (app.yaw_zero_degrees = Float32(yaw))
-        push!(app.sample_indices, index)
-        push!(app.times, time_s)
-        push!(app.pitch_degrees, _zero_relative_angle(Float32(pitch), app.pitch_zero_degrees))
-        push!(app.yaw_degrees, _zero_relative_angle(Float32(yaw), app.yaw_zero_degrees))
-        push!(app.rpm, Float32(speed))
-        push!(app.rpm_target, Float32(target))
-        push!(app.ctrl_saturated, 0.0f0)
-        push!(app.esc_throttle, Float32(throttle))
-        app.demo_index += UInt64(app.decimation)
     end
     return nothing
 end
@@ -902,9 +1086,10 @@ function start_receiving!(app::WhirlApp)
     try
         if app.demo
             initialise_motor_control!(app)
+            writer = _start_capture!(app)
             app.running = true
             app.status_text[] = "Receiving · DEMO"
-            app.info_text[] = "Synthetic 2 kHz source; no MCU required"
+            app.info_text[] = "Synthetic 2 kHz source; recording to $(writer.partial_path)"
             app.busy = false
             @async demo_loop!(app, session)
             return nothing
@@ -917,6 +1102,10 @@ function start_receiving!(app::WhirlApp)
         initialise_motor_control!(app)
         device_status = HelicDAQ.status(app.device)
         app.sample_rate = Float64(device_status.sample_rate)
+        _resize_plot_buffer!(
+            app.plot_buffer,
+            _plot_buffer_capacity(app.sample_rate, app.decimation, app.window_seconds),
+        )
         configure_stream!(app.device, WHIRL_SOURCES; decimation = app.decimation, count = 0)
         receiver = HelicDAQ.StreamReceiver(; port = 0, timeout = STREAM_TIMEOUT_SECONDS)
         app.receiver = receiver
@@ -938,6 +1127,7 @@ function start_receiving!(app::WhirlApp)
             end
             return nothing
         end
+        writer = _start_capture!(app)
         app.running = true
         if app.tripped
             app.status_text[] = "Motor safety trip"
@@ -946,7 +1136,7 @@ function start_receiving!(app::WhirlApp)
         else
             app.status_text[] = "Receiving · LIVE"
             app.info_text[] =
-                "$(app.sample_rate) Hz firmware · $(app.motor_profile.label) · decimation $(app.decimation)"
+                "$(app.sample_rate) Hz firmware · decimation $(app.decimation) · recording to $(writer.partial_path)"
         end
         app.busy = false
         @async receive_loop!(app, session)
@@ -958,8 +1148,10 @@ function start_receiving!(app::WhirlApp)
         _update_motor_text!(app)
         _close_receiver!(app)
         _close_device!(app)
+        partial_path = _close_partial_capture!(app)
         app.status_text[] = "Connection error"
-        app.info_text[] = sprint(showerror, error)
+        suffix = isnothing(partial_path) ? "" : "; partial capture kept at $partial_path"
+        app.info_text[] = "$(sprint(showerror, error))$suffix"
     end
     return nothing
 end
@@ -972,6 +1164,10 @@ function keepalive_loop!(app::WhirlApp, session::UInt64)
             _sync_safety_state!(app)
         catch error
             app.running && session == app.session || break
+            if error isa CaptureError
+                _stop_for_capture_error!(app, error)
+                break
+            end
             app.running = false
             app.armed = false
             _update_motor_text!(app)
@@ -979,6 +1175,11 @@ function keepalive_loop!(app::WhirlApp, session::UInt64)
             app.info_text[] = "Control heartbeat failed: $(sprint(showerror, error))"
             _close_receiver!(app)
             _close_device!(app)
+            try
+                _finalize_capture!(app)
+            catch capture_error
+                app.info_text[] *= "; $(sprint(showerror, capture_error))"
+            end
             break
         end
     end
@@ -987,7 +1188,15 @@ end
 
 function demo_loop!(app::WhirlApp, session::UInt64)
     while app.running && session == app.session
-        append_demo_chunk!(app)
+        try
+            append_demo_chunk!(app)
+        catch error
+            if error isa CaptureError
+                _stop_for_capture_error!(app, error)
+                break
+            end
+            rethrow(error)
+        end
         sleep(0.02)
     end
     return nothing
@@ -1030,6 +1239,10 @@ function receive_loop!(app::WhirlApp, session::UInt64)
                 end
             end
             app.running && session == app.session || break
+            if error isa CaptureError
+                _stop_for_capture_error!(app, error)
+                break
+            end
             app.running = false
             app.armed = false
             _update_motor_text!(app)
@@ -1037,6 +1250,12 @@ function receive_loop!(app::WhirlApp, session::UInt64)
             app.info_text[] = sprint(showerror, error)
             _close_receiver!(app)
             _close_device!(app)
+            try
+                result = _finalize_capture!(app)
+                isnothing(result) || (app.info_text[] *= "; saved $(result.rows) rows to $(result.path)")
+            catch capture_error
+                app.info_text[] *= "; $(sprint(showerror, capture_error))"
+            end
             break
         end
     end
@@ -1059,28 +1278,33 @@ function pause_receiving!(app::WhirlApp)
         end
     end
     _close_receiver!(app)
-    app.status_text[] = "Paused"
-    app.info_text[] = "Motor disarmed; stored data are retained; Start resumes acquisition"
+    try
+        result = _finalize_capture!(app)
+        app.status_text[] = "Paused"
+        app.info_text[] = isnothing(result) ?
+            "Motor disarmed; Start begins a new disk recording" :
+            "Motor disarmed; saved $(result.rows) samples to $(result.path)"
+    catch error
+        app.status_text[] = "Paused · save error"
+        app.info_text[] = sprint(showerror, error)
+    end
     return nothing
 end
 
 function clear_data!(app::WhirlApp)
-    empty!(app.times)
-    empty!(app.sample_indices)
-    empty!(app.pitch_degrees)
-    empty!(app.yaw_degrees)
-    empty!(app.rpm)
-    empty!(app.rpm_target)
-    empty!(app.ctrl_saturated)
-    empty!(app.esc_throttle)
-    app.pitch_zero_degrees = nothing
-    app.yaw_zero_degrees = nothing
-    app.first_index = nothing
-    app.previous_raw_index = nothing
-    app.index_wraps = 0
-    app.demo_index = 0
-    app.dropped = 0
-    app.lost_packets = 0
+    empty!(app.plot_buffer)
+    app.latest_ctrl_saturated = 0.0f0
+    if !app.running && isnothing(app.capture)
+        app.pitch_zero_degrees = nothing
+        app.yaw_zero_degrees = nothing
+        app.first_index = nothing
+        app.previous_raw_index = nothing
+        app.index_wraps = 0
+        app.demo_index = 0
+        app.total_samples = 0
+        app.dropped = 0
+        app.lost_packets = 0
+    end
     app.plot_time[] = Float64[]
     app.plot_pitch_points[] = Point2f[]
     app.plot_yaw_points[] = Point2f[]
@@ -1094,111 +1318,353 @@ function clear_data!(app::WhirlApp)
     xlims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     ylims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     app.status_text[] = app.running ? app.status_text[] : "Idle"
-    app.info_text[] = app.running ? "Buffer cleared; acquisition continues" : "Buffer cleared"
+    app.info_text[] = app.running ?
+        "Plot window cleared; disk recording continues unchanged" :
+        "Plot window and session counters cleared; saved CSV files are unchanged"
     return nothing
 end
 
 function _default_save_path(
-        directory = joinpath(@__DIR__, "..", "captures");
+        directory = CAPTURE_DIRECTORY;
         timestamp = now(),
     )
     stem = "whirl_capture_$(Dates.format(timestamp, "yyyymmdd_HHMMSS_sss"))"
     path = joinpath(directory, "$stem.csv")
     suffix = 2
-    while ispath(path)
+    while ispath(path) || ispath("$path.partial")
         path = joinpath(directory, "$(stem)_$suffix.csv")
         suffix += 1
     end
     return path
 end
 
-function save_csv!(app::WhirlApp; default_directory = joinpath(@__DIR__, "..", "captures"))
-    isempty(app.times) && begin
-        app.info_text[] = "Nothing to save yet"
-        return nothing
+function _normalise_csv_path(path::AbstractString)
+    expanded = abspath(expanduser(strip(path)))
+    lowercase_path = lowercase(expanded)
+    if endswith(lowercase_path, ".csv.partial")
+        return chop(expanded; tail = length(".partial"))
+    elseif endswith(lowercase_path, ".csv")
+        return expanded
     end
+    return "$expanded.csv"
+end
+
+function _numbered_path(path::AbstractString, suffix::Integer)
+    stem, extension = splitext(path)
+    return "$(stem)_$suffix$extension"
+end
+
+function _unused_path(path::AbstractString; conflicts = path -> ispath(path))
+    candidate = String(path)
+    suffix = 2
+    while conflicts(candidate)
+        candidate = _numbered_path(path, suffix)
+        suffix += 1
+    end
+    return candidate
+end
+
+function _requested_save_path(app::WhirlApp)
+    isnothing(app.save_path) && return nothing
     requested = app.save_path.stored_string[]
-    automatic_path = isnothing(requested) || isempty(strip(requested))
-    path = automatic_path ? _default_save_path(default_directory) : abspath(expanduser(strip(requested)))
-    times = copy(app.times)
-    indices = copy(app.sample_indices)
-    pitch = copy(app.pitch_degrees)
-    yaw = copy(app.yaw_degrees)
-    speeds = copy(app.rpm)
-    targets = copy(app.rpm_target)
-    throttles = copy(app.esc_throttle)
-    saturated = copy(app.ctrl_saturated)
-    try
-        mkpath(dirname(path))
-        open(path, "w") do io
-            println(io, "time_s,sample_index,pitch_deg,yaw_deg,rpm,rpm_target,esc_throttle,ctrl_saturated")
-            for row in eachindex(times)
-                println(
-                    io,
-                    times[row],
-                    ',',
-                    indices[row],
-                    ',',
-                    pitch[row],
-                    ',',
-                    yaw[row],
-                    ',',
-                    speeds[row],
-                    ',',
-                    targets[row],
-                    ',',
-                    throttles[row],
-                    ',',
-                    saturated[row],
-                )
-            end
-        end
-        app.info_text[] = "Saved $(length(times)) samples to $path"
-    catch error
-        app.status_text[] = "Save error"
-        app.info_text[] = sprint(showerror, error)
+    isnothing(requested) && return nothing
+    stripped = strip(requested)
+    return isempty(stripped) ? nothing : _normalise_csv_path(stripped)
+end
+
+function _next_capture_path(app::WhirlApp)
+    requested = _requested_save_path(app)
+    if isnothing(requested)
+        return _default_save_path(app.capture_directory)
     end
+    return _unused_path(
+        requested;
+        conflicts = path -> ispath(path) || ispath("$path.partial"),
+    )
+end
+
+function _open_capture_locked!(app::WhirlApp)
+    isnothing(app.capture) || throw(ArgumentError("a capture file is already open"))
+    final_path = _next_capture_path(app)
+    partial_path = "$final_path.partial"
+    mkpath(dirname(final_path))
+    ispath(final_path) && throw(ArgumentError("capture already exists: $final_path"))
+    ispath(partial_path) && throw(ArgumentError("partial capture already exists: $partial_path"))
+    io = open(partial_path, "w")
+    try
+        println(io, CAPTURE_HEADER)
+        flush(io)
+    catch error
+        close(io)
+        rethrow(error)
+    end
+    app.capture = CaptureWriter(partial_path, final_path, io, UInt64(0), UInt64(time_ns()))
+    return app.capture
+end
+
+function _start_capture!(app::WhirlApp)
+    return lock(app.capture_lock) do
+        _open_capture_locked!(app)
+    end
+end
+
+function _file_ends_with_newline(path::AbstractString)
+    return open(path, "r") do io
+        seekend(io)
+        isempty = iszero(position(io))
+        isempty && return false
+        seek(io, position(io) - 1)
+        return read(io, UInt8) == UInt8('\n')
+    end
+end
+
+function _validate_closed_capture(writer::CaptureWriter)
+    open(writer.partial_path, "r") do io
+        eof(io) && throw(ArgumentError("partial capture is empty"))
+        readline(io) == CAPTURE_HEADER || throw(ArgumentError("partial capture has an unexpected header"))
+    end
+    _file_ends_with_newline(writer.partial_path) ||
+        throw(ArgumentError("partial capture does not end with a complete row"))
     return nothing
 end
 
+function _finalize_capture_locked!(app::WhirlApp)
+    writer = app.capture
+    isnothing(writer) && return nothing
+    app.capture = nothing
+    try
+        flush(writer.io)
+        close(writer.io)
+        _validate_closed_capture(writer)
+        ispath(writer.final_path) && throw(ArgumentError("capture already exists: $(writer.final_path)"))
+        mv(writer.partial_path, writer.final_path)
+    catch error
+        isopen(writer.io) && close(writer.io)
+        throw(CaptureError("could not finalise $(writer.partial_path): $(sprint(showerror, error))"))
+    end
+    return (; path = writer.final_path, rows = writer.row_count)
+end
+
+function _finalize_capture!(app::WhirlApp)
+    return lock(app.capture_lock) do
+        _finalize_capture_locked!(app)
+    end
+end
+
+function _close_partial_capture!(app::WhirlApp)
+    return lock(app.capture_lock) do
+        writer = app.capture
+        isnothing(writer) && return nothing
+        app.capture = nothing
+        try
+            flush(writer.io)
+        catch
+        end
+        try
+            isopen(writer.io) && close(writer.io)
+        catch
+        end
+        return writer.partial_path
+    end
+end
+
+function _capture_row_index(line::AbstractString)
+    fields = split(line, ','; keepempty = true)
+    length(fields) == 8 || return nothing
+    parsers = (Float64, UInt64, Float32, Float32, Float32, Float32, Float32, Float32)
+    values = ntuple(index -> tryparse(parsers[index], fields[index]), length(parsers))
+    any(isnothing, values) && return nothing
+    return values[2]
+end
+
+function recover_partial_capture!(partial_path::AbstractString)
+    path = abspath(partial_path)
+    endswith(lowercase(path), ".csv.partial") ||
+        throw(ArgumentError("not a .csv.partial file: $path"))
+    isfile(path) || throw(ArgumentError("partial capture does not exist: $path"))
+    recovered_base = "$(chop(path; tail = length(".csv.partial")))_recovered.csv"
+    recovered_path = _unused_path(recovered_base)
+    archive_path = _unused_path("$path.original")
+    temporary_path = "$recovered_path.recovering"
+    complete_ending = _file_ends_with_newline(path)
+    rows = UInt64(0)
+    discarded_tail = false
+    previous_index = nothing
+    try
+        open(path, "r") do input
+            eof(input) && throw(ArgumentError("partial capture is empty"))
+            readline(input) == CAPTURE_HEADER ||
+                throw(ArgumentError("partial capture has an unexpected header"))
+            open(temporary_path, "w") do output
+                println(output, CAPTURE_HEADER)
+                while !eof(input)
+                    line = readline(input)
+                    if eof(input) && !complete_ending
+                        discarded_tail = true
+                        break
+                    end
+                    sample_index = _capture_row_index(line)
+                    if isnothing(sample_index) ||
+                            (!isnothing(previous_index) && sample_index <= previous_index)
+                        discarded_tail = true
+                        break
+                    end
+                    println(output, line)
+                    rows += 1
+                    previous_index = sample_index
+                    iszero(rows % 100_000) && yield()
+                end
+                flush(output)
+            end
+        end
+        rows > 0 || throw(ArgumentError("partial capture contains no complete data rows"))
+        mv(temporary_path, recovered_path)
+        mv(path, archive_path)
+    catch
+        ispath(temporary_path) && rm(temporary_path)
+        rethrow()
+    end
+    return (;
+        source = path,
+        recovered = recovered_path,
+        original = archive_path,
+        rows,
+        discarded_tail,
+    )
+end
+
+function _partial_capture_paths(directory::AbstractString; excluded = Set{String}())
+    isdir(directory) || return String[]
+    return sort!(
+        [
+            abspath(path) for path in readdir(directory; join = true) if
+                endswith(lowercase(path), ".csv.partial") && abspath(path) ∉ excluded
+        ],
+    )
+end
+
+function recover_partial_captures!(app::WhirlApp)
+    requested = _requested_save_path(app)
+    directories = Set([app.capture_directory])
+    isnothing(requested) || push!(directories, dirname(requested))
+    excluded = Set{String}()
+    isnothing(app.capture) || push!(excluded, abspath(app.capture.partial_path))
+    paths = reduce(vcat, [_partial_capture_paths(directory; excluded) for directory in directories]; init = String[])
+    isempty(paths) && begin
+        app.info_text[] = "No recoverable .csv.partial files found"
+        return nothing
+    end
+    results = NamedTuple[]
+    failures = Pair{String, String}[]
+    for path in paths
+        try
+            push!(results, recover_partial_capture!(path))
+        catch error
+            push!(failures, path => sprint(showerror, error))
+        end
+    end
+    recovered_rows = sum(result.rows for result in results; init = UInt64(0))
+    message = "Recovered $(length(results)) file(s), $recovered_rows rows; original bytes kept as .partial.original"
+    isempty(failures) || (message *= "; $(length(failures)) file(s) could not be recovered")
+    app.info_text[] = message
+    return (; results, failures)
+end
+
+function save_csv!(app::WhirlApp)
+    result = try
+        lock(app.capture_lock) do
+            writer = app.capture
+            isnothing(writer) && return (; state = :missing, saved = nothing, next_writer = nothing)
+            iszero(writer.row_count) && return (; state = :empty, saved = nothing, next_writer = nothing)
+            saved = _finalize_capture_locked!(app)
+            next_writer = app.running ? _open_capture_locked!(app) : nothing
+            return (; state = :saved, saved, next_writer)
+        end
+    catch error
+        _stop_for_capture_error!(app, error)
+        return nothing
+    end
+    if result.state == :missing
+        app.info_text[] = "No active recording to save"
+        return nothing
+    elseif result.state == :empty
+        app.info_text[] = "The active recording has no samples yet"
+        return nothing
+    end
+    if isnothing(result.next_writer)
+        app.info_text[] = "Saved $(result.saved.rows) samples to $(result.saved.path)"
+    else
+        app.info_text[] =
+            "Saved $(result.saved.rows) samples to $(result.saved.path); recording continues in $(result.next_writer.partial_path)"
+    end
+    _restore_normal_status!(app)
+    return result.saved.path
+end
+
 function update_plots!(app::WhirlApp)
-    count = length(app.times)
-    app.stats_text[] = "$(count) samples\nDevice drops: $(app.dropped)\nUDP gaps: $(app.lost_packets)"
-    count == 0 && return nothing
-    current_rpm = app.rpm[end]
+    capture_rows = lock(app.capture_lock) do
+        isnothing(app.capture) ? UInt64(0) : app.capture.row_count
+    end
+    app.stats_text[] =
+        "Session: $(app.total_samples) samples\nCurrent file: $capture_rows\nDevice drops: $(app.dropped)\nUDP gaps: $(app.lost_packets)"
+    isempty(app.plot_buffer) && return nothing
+    latest = app.plot_buffer[end]
+    current_rpm = latest.rpm
     app.rpm_text[] = @sprintf("%.0f RPM", current_rpm)
-    rpm_extent = max(current_rpm, app.rpm_target[end])
+    rpm_extent = max(current_rpm, latest.rpm_target)
     ylims!(app.rpm_axis, _rpm_plot_limits(rpm_extent)...)
-    first_visible = searchsortedfirst(app.times, max(0.0, app.times[end] - app.window_seconds))
-    stride = max(1, cld(count - first_visible + 1, MAX_PLOT_POINTS))
-    selection = collect(first_visible:stride:count)
-    selection[end] == count || push!(selection, count)
-    plot_time = app.times[selection]
-    plot_pitch = app.pitch_degrees[selection]
-    plot_yaw = app.yaw_degrees[selection]
+    cutoff = max(0.0, latest.time_s - app.window_seconds)
+    first_visible = _plot_searchsortedfirst(app.plot_buffer, cutoff)
+    visible_count = length(app.plot_buffer) - first_visible + 1
+    stride = max(1, cld(visible_count, MAX_PLOT_POINTS))
+    selection = collect(first_visible:stride:length(app.plot_buffer))
+    selection[end] == length(app.plot_buffer) || push!(selection, length(app.plot_buffer))
+    plot_time = Vector{Float64}(undef, length(selection))
+    plot_pitch_points = Vector{Point2f}(undef, length(selection))
+    plot_yaw_points = Vector{Point2f}(undef, length(selection))
+    plot_rpm_points = Vector{Point2f}(undef, length(selection))
+    plot_target_points = Vector{Point2f}(undef, length(selection))
+    plot_orbit_points = Vector{Point2f}(undef, length(selection))
+    for (output_index, buffer_index) in enumerate(selection)
+        sample = app.plot_buffer[buffer_index]
+        plot_time[output_index] = sample.time_s
+        plot_pitch_points[output_index] = Point2f(sample.time_s, sample.pitch_degrees)
+        plot_yaw_points[output_index] = Point2f(sample.time_s, sample.yaw_degrees)
+        plot_rpm_points[output_index] = Point2f(sample.time_s, sample.rpm)
+        plot_target_points[output_index] = Point2f(sample.time_s, sample.rpm_target)
+        plot_orbit_points[output_index] = Point2f(sample.pitch_degrees, sample.yaw_degrees)
+    end
     # A single point-vector observable keeps x/y lengths atomic for GLMakie's
     # asynchronous renderer and avoids the mismatch storm caused by separate
     # x and y observables.
     app.plot_time[] = plot_time
-    app.plot_pitch_points[] = Point2f.(plot_time, plot_pitch)
-    app.plot_yaw_points[] = Point2f.(plot_time, plot_yaw)
-    app.plot_rpm_points[] = Point2f.(plot_time, app.rpm[selection])
-    app.plot_target_points[] = Point2f.(plot_time, app.rpm_target[selection])
-    app.plot_orbit_points[] = Point2f.(plot_pitch, plot_yaw)
-    app.plot_orbit_current[] = Point2f[(app.pitch_degrees[end], app.yaw_degrees[end])]
+    app.plot_pitch_points[] = plot_pitch_points
+    app.plot_yaw_points[] = plot_yaw_points
+    app.plot_rpm_points[] = plot_rpm_points
+    app.plot_target_points[] = plot_target_points
+    app.plot_orbit_points[] = plot_orbit_points
+    app.plot_orbit_current[] = Point2f[(latest.pitch_degrees, latest.yaw_degrees)]
     _update_motor_text!(app)
-    angle_lower, angle_upper = _angle_plot_limits(
-        @view(app.pitch_degrees[first_visible:count]),
-        @view(app.yaw_degrees[first_visible:count]),
-    )
+    absolute_maximum = 0.0f0
+    for index in first_visible:length(app.plot_buffer)
+        sample = app.plot_buffer[index]
+        absolute_maximum = max(
+            absolute_maximum,
+            abs(sample.pitch_degrees),
+            abs(sample.yaw_degrees),
+        )
+    end
+    angle_extent = absolute_maximum + ANGLE_MARGIN_DEGREES
+    angle_lower, angle_upper = -Float64(angle_extent), Float64(angle_extent)
     ylims!(app.angle_axis, angle_lower, angle_upper)
-    orbit_lower, orbit_upper = _orbit_plot_limits(
-        @view(app.pitch_degrees[first_visible:count]),
-        @view(app.yaw_degrees[first_visible:count]),
+    orbit_extent = max(
+        ORBIT_MINIMUM_EXTENT_DEGREES,
+        (1 + ORBIT_MARGIN_FRACTION) * absolute_maximum,
     )
+    orbit_lower, orbit_upper = -Float64(orbit_extent), Float64(orbit_extent)
     xlims!(app.orbit_axis, orbit_lower, orbit_upper)
     ylims!(app.orbit_axis, orbit_lower, orbit_upper)
-    right = max(app.window_seconds, app.times[end])
+    right = max(app.window_seconds, latest.time_s)
     left = max(0.0, right - app.window_seconds)
     xlims!(app.angle_axis, left, right)
     xlims!(app.rpm_axis, left, right)
@@ -1221,6 +1687,27 @@ function _close_device!(app::WhirlApp)
     return nothing
 end
 
+function _stop_for_capture_error!(app::WhirlApp, error)
+    app.session += 1
+    was_running = app.running
+    app.running = false
+    app.busy = false
+    emergency_stop!(app; report = false)
+    if !app.demo && was_running && !isnothing(app.device) && isopen(app.device)
+        try
+            stop_stream!(app.device)
+        catch
+        end
+    end
+    _close_receiver!(app)
+    _close_device!(app)
+    partial_path = _close_partial_capture!(app)
+    app.status_text[] = "Capture error"
+    suffix = isnothing(partial_path) ? "" : "; recoverable data kept at $partial_path"
+    app.info_text[] = "$(sprint(showerror, error))$suffix"
+    return nothing
+end
+
 function shutdown!(app::WhirlApp)
     app.session += 1
     emergency_stop!(app; report = false)
@@ -1228,6 +1715,13 @@ function shutdown!(app::WhirlApp)
     app.busy = false
     _close_receiver!(app)
     _close_device!(app)
+    try
+        _finalize_capture!(app)
+    catch error
+        _close_partial_capture!(app)
+        app.status_text[] = "Shutdown save error"
+        app.info_text[] = sprint(showerror, error)
+    end
     return nothing
 end
 
@@ -1268,6 +1762,9 @@ function main(arguments = ARGS)
     GLMakie.activate!()
     app = WhirlApp(options.host, options.demo, options.decimation, options.window_seconds)
     figure = build_figure!(app)
+    partials = _partial_capture_paths(app.capture_directory)
+    isempty(partials) ||
+        (app.info_text[] = "Found $(length(partials)) crash file(s); use Recover crash files to create checked CSV copies")
     screen = display(figure)
     # `window_open` is false until GLMakie creates the screen. Starting this
     # task before `display` can make it exit immediately, leaving live data in

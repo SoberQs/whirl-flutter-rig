@@ -93,8 +93,23 @@ On macOS, `run_gui.command` can also be opened directly from Finder. Pass
 ./run_gui.command --demo
 ```
 
-The GUI's **Save CSV** button writes captures to the project-level `captures/`
-directory by default.
+The GUI opens a `*.csv.partial` file in the project-level `captures/`
+directory when acquisition starts, appends samples as they arrive, and flushes
+the file once per second. It therefore keeps only the fixed live-plot window in
+RAM. **Save CSV** flushes and closes the current file, renames it atomically to
+`*.csv`, and, if acquisition is still running, immediately starts a new
+`*.csv.partial` recording. **Pause + Disarm** and a normal window close also
+finalise the current CSV. **Clear** only clears the in-memory plot while
+acquisition is running; it never deletes or truncates recorded data.
+
+An application or graphics-driver crash can leave a `*.csv.partial` file.
+After restarting the GUI, press **Recover crash files**. Recovery copies the
+consecutive complete rows with parseable columns and increasing
+`sample_index` values to `*_recovered.csv`. A possibly incomplete final row is
+discarded. The original bytes are retained by renaming the source to
+`*.csv.partial.original`; recovery never overwrites an existing CSV. Files
+whose header is invalid or which contain no complete data rows are left
+untouched and reported as failures.
 
 ### Motor operation
 
@@ -111,9 +126,9 @@ disarmed with zero manual throttle and a zero RPM target.
    profile's displayed configured RPM range and press Enter.
 3. Press **ARM**. Manual mode can only be armed at 0%; closed-loop mode can
    only be armed with a non-zero target.
-4. In manual mode, use the Up and Down arrow keys for 1% throttle steps. Key
-   repeat is rate-limited to 20 commands per second, and the selected profile
-   limits the largest GUI command. In closed-loop mode, the MCU adjusts
+4. In manual mode, use the Up and Down arrow keys for the selected profile's
+   displayed throttle step. Key repeat is rate-limited to 20 commands per
+   second, and the profile limits the largest GUI command. In closed-loop mode, the MCU adjusts
    throttle and indicates when the requested speed is unreachable at the safe
    output limit.
 5. Press Space or **STOP / DISARM** at any time. Pause, window closure, stream
@@ -140,8 +155,9 @@ envelope exposed by the GUI, and applies `ctrl_kp`, `ctrl_ki`, and `ctrl_ramp`
 while disarmed. Its feedback and ESC fields document the matching compiled
 firmware profile; they are not writable safety overrides.
 
-The checked-in MN2806 profile exposes 2000--6000 RPM closed loop and up to 90%
-manual throttle. This configured range is wider than the 16.5 V hardware
+The checked-in MN2806 profile exposes 2000--6000 RPM closed loop, 1% keyboard
+steps, and up to 90% manual throttle. This configured range is wider than the
+16.5 V hardware
 evidence recorded on 2026-08-24, which reached 3000 RPM closed loop and 20%
 manual throttle; the untested portion must therefore remain an explicit
 bring-up activity. Add a separately evidenced `[[profiles]]` entry before
@@ -149,6 +165,24 @@ using a different motor. A motor needing a lower overspeed limit or different
 feedback timing also requires a firmware configuration change and a new
 hardware test; editing the GUI profile alone cannot weaken the MCU's 6500 RPM
 trip.
+
+The default profile is now the CINE66 KV925, AIR 40A, 25 V combination with the
+fitted 8×6 propeller. Its still-air hardware envelope is 2000--6000 RPM and
+1130--1294 us (approximately 3.57--23.10% manual throttle). Each arrow-key
+press changes the ESC command by one physical microsecond (about 0.119%
+throttle), which is the finest useful step with the current
+integer-microsecond firmware mapping. Loaded PI gains reach and hold the
+configured target band in approximately 2.0--3.1 s at the tested endpoints.
+This evidence does not cover a different propeller, wind-tunnel aerodynamic
+load, supply current or droop, temperature, or vibration; create and test a
+separate profile rather than widening this one for those conditions.
+
+The earlier no-propeller CINE66 profile remains available. Its configured 90%
+manual ceiling is intentionally wider than its 5.48% hardware evidence and is
+therefore a supervised bring-up setting, not a verified operating limit. The
+currently flashed firmware starts its missing-feedback timer at 15% throttle.
+That covers only the upper part of the loaded profile and none of the unloaded
+profile, so low-speed physical feedback-loss protection remains outstanding.
 
 The CSV format now adds `rpm_target`, `esc_throttle`, and `ctrl_saturated`.
 `src/plot.jl` remains compatible with older five-column captures.

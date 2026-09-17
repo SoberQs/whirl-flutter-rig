@@ -36,6 +36,7 @@ struct MotorProfile
     target_min_rpm::Float32
     target_max_rpm::Float32
     manual_max_throttle::Float32
+    manual_step_throttle::Float32
     kp::Float32
     ki::Float32
     ramp_per_s::Float32
@@ -93,6 +94,7 @@ function _motor_profile(table::AbstractDict, index::Integer)
         _float(table, "target_min_rpm", context),
         _float(table, "target_max_rpm", context),
         _float(table, "manual_max_throttle", context),
+        _float(table, "manual_step_throttle", context),
         _float(table, "kp", context),
         _float(table, "ki", context),
         _float(table, "ramp_per_s", context),
@@ -114,6 +116,8 @@ function _motor_profile(table::AbstractDict, index::Integer)
         throw(ArgumentError("$context target range must fit inside 0–$(Int(FIRMWARE_TARGET_MAX_RPM)) RPM"))
     0 < profile.manual_max_throttle <= 1 ||
         throw(ArgumentError("$context.manual_max_throttle must be in (0, 1]"))
+    0 < profile.manual_step_throttle <= profile.manual_max_throttle ||
+        throw(ArgumentError("$context.manual_step_throttle must be in (0, manual_max_throttle]"))
     profile.kp >= 0 || throw(ArgumentError("$context.kp must be non-negative"))
     profile.ki >= 0 || throw(ArgumentError("$context.ki must be non-negative"))
     0 < profile.ramp_per_s <= 10 || throw(ArgumentError("$context.ramp_per_s must be in (0, 10]"))
@@ -130,8 +134,8 @@ end
 """Load and validate the versioned motor-profile configuration."""
 function load_motor_profiles(path::AbstractString = DEFAULT_MOTOR_PROFILES_PATH)
     configuration = TOML.parsefile(path)
-    get(configuration, "schema_version", nothing) == 1 ||
-        throw(ArgumentError("motor profile schema_version must be 1"))
+    get(configuration, "schema_version", nothing) == 2 ||
+        throw(ArgumentError("motor profile schema_version must be 2"))
     default_id = _string(configuration, "default_profile", "motor profiles")
     raw_profiles = _required(configuration, "profiles", "motor profiles")
     raw_profiles isa AbstractVector || throw(ArgumentError("motor profiles must be an array"))
