@@ -88,10 +88,12 @@ julia --project=. src/gui.jl \
 
 The button below the lower-left plot switches between rotor speed and a live
 pitch/yaw FFT. The spectrum uses the most recent 10 seconds, removes each
-angle's mean, applies a Hann window, and displays single-sided amplitudes up to
-200 Hz. Missing streamed samples are linearly interpolated onto the known
-sample clock before transforming. The pitch–yaw orbit uses yaw on the
-horizontal axis and pitch on the vertical axis.
+angle's mean, applies a Hann window, and displays single-sided amplitudes. Set
+the horizontal-axis upper limit in the **FFT max [Hz]** box while acquisition
+is running and press Enter; the requested value is limited automatically to
+the stream's Nyquist frequency. Missing streamed samples are linearly
+interpolated onto the known sample clock before transforming. The pitch–yaw
+orbit uses yaw on the horizontal axis and pitch on the vertical axis.
 
 On macOS, `run_gui.command` can also be opened directly from Finder. Pass
 `--demo` when launching it from Terminal to use simulated input:

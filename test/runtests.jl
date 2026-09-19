@@ -35,6 +35,12 @@ end
 @testset "live angle FFT" begin
     short_plot_app = WhirlApp("offline", false, 2, 3.0)
     @test length(short_plot_app.plot_buffer.storage) == 10_001
+    @test _parse_fft_max_frequency("75", 2_000, 2) ==
+        (requested = 75.0, applied = 75.0, nyquist = 500.0)
+    @test _parse_fft_max_frequency("750", 2_000, 2) ==
+        (requested = 750.0, applied = 500.0, nyquist = 500.0)
+    @test_throws ArgumentError _parse_fft_max_frequency("0", 2_000, 1)
+    @test_throws ArgumentError _parse_fft_max_frequency("wide", 2_000, 1)
 
     sample_rate = 200.0
     times = collect(0:(1 / sample_rate):(10 - 1 / sample_rate))

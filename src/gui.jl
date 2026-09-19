@@ -197,11 +197,13 @@ mutable struct WhirlApp
     last_motor_command_s::Float64
     lower_plot_mode::Symbol
     last_fft_update_s::Float64
+    fft_max_frequency_hz::Float64
     angle_axis::Any
     rpm_axis::Any
     fft_axis::Any
     orbit_axis::Any
     lower_plot_button::Any
+    fft_frequency_box::Any
     rpm_legend::Any
     fft_legend::Any
     save_path::Any
@@ -268,6 +270,8 @@ function WhirlApp(host, demo, decimation, window_seconds; capture_directory = CA
         -Inf,
         :rpm,
         -Inf,
+        FFT_MAX_FREQUENCY_HZ,
+        nothing,
         nothing,
         nothing,
         nothing,
@@ -339,12 +343,29 @@ function build_figure!(app::WhirlApp)
         ylabel = "Amplitude [deg]",
     )
     GLMakie.Makie.hide!(fft_axis)
+    lower_plot_controls = GridLayout(; colgap = 8)
+    speed_panel[2, 1] = lower_plot_controls
     lower_plot_button = Button(
-        speed_panel[2, 1];
+        lower_plot_controls[1, 1];
         label = "Show angle FFT",
         height = 30,
         width = 150,
         tellwidth = false,
+    )
+    Label(
+        lower_plot_controls[1, 2],
+        "FFT max [Hz]";
+        fontsize = 12,
+        halign = :right,
+        tellwidth = false,
+    )
+    fft_frequency_box = Textbox(
+        lower_plot_controls[1, 3];
+        placeholder = string(Int(FFT_MAX_FREQUENCY_HZ)),
+        height = 30,
+        width = 75,
+        tellwidth = false,
+        halign = :left,
     )
     rowsize!(speed_panel, 2, Fixed(30))
     orbit_axis = Axis(
@@ -594,6 +615,7 @@ function build_figure!(app::WhirlApp)
     app.fft_axis = fft_axis
     app.orbit_axis = orbit_axis
     app.lower_plot_button = lower_plot_button
+    app.fft_frequency_box = fft_frequency_box
     app.rpm_legend = rpm_legend
     app.fft_legend = fft_legend
     app.save_path = save_path
@@ -650,8 +672,12 @@ function build_figure!(app::WhirlApp)
         isnothing(text) || @async set_target_rpm!(app, text)
         return nothing
     end
+    on(fft_frequency_box.stored_string) do text
+        isnothing(text) || set_fft_max_frequency!(app, text)
+        return nothing
+    end
     on(events(figure).keyboardbutton, priority = 10) do event
-        typing = target_rpm_box.focused[] || save_path.focused[]
+        typing = target_rpm_box.focused[] || fft_frequency_box.focused[] || save_path.focused[]
         active = event.action == Keyboard.press || event.action == Keyboard.repeat
         if !typing && active && event.key in (Keyboard.up, Keyboard.down)
             direction = event.key == Keyboard.up ? 1 : -1
@@ -780,6 +806,47 @@ function _amplitude_spectrum(
     )
 end
 
+function _parse_fft_max_frequency(text::AbstractString, sample_rate::Real, decimation::Integer)
+    value = tryparse(Float64, strip(text))
+    isnothing(value) && throw(ArgumentError("FFT maximum frequency must be a number"))
+    isfinite(value) || throw(ArgumentError("FFT maximum frequency must be finite"))
+    minimum_frequency = 1 / FFT_WINDOW_SECONDS
+    value >= minimum_frequency || throw(
+        ArgumentError(
+            "FFT maximum frequency must be at least $minimum_frequency Hz",
+        ),
+    )
+    sample_rate > 0 || throw(ArgumentError("sample rate must be positive"))
+    decimation > 0 || throw(ArgumentError("decimation must be positive"))
+    nyquist = Float64(sample_rate) / (2 * decimation)
+    return (requested = value, applied = min(value, nyquist), nyquist)
+end
+
+function set_fft_max_frequency!(app::WhirlApp, text::AbstractString)
+    limit = try
+        _parse_fft_max_frequency(text, app.sample_rate, app.decimation)
+    catch error
+        app.status_text[] = "Invalid FFT range"
+        app.info_text[] = sprint(showerror, error)
+        return nothing
+    end
+    app.fft_max_frequency_hz = limit.applied
+    app.last_fft_update_s = -Inf
+    xlims!(app.fft_axis, 0, limit.applied)
+    app.lower_plot_mode == :fft && update_fft!(app; force = true)
+    _restore_normal_status!(app)
+    app.info_text[] = if limit.requested > limit.applied
+        @sprintf(
+            "FFT range limited to 0–%.1f Hz by the %.1f Hz Nyquist frequency",
+            limit.applied,
+            limit.nyquist,
+        )
+    else
+        @sprintf("FFT display range set to 0–%.1f Hz", limit.applied)
+    end
+    return nothing
+end
+
 function update_fft!(app::WhirlApp; force::Bool = false)
     app.lower_plot_mode == :fft || return nothing
     current_time = time()
@@ -794,11 +861,23 @@ function update_fft!(app::WhirlApp; force::Bool = false)
         app.plot_fft_pitch_points[] = Point2f[]
         app.plot_fft_yaw_points[] = Point2f[]
         ylims!(app.fft_axis, 0, FFT_MINIMUM_AMPLITUDE_DEGREES)
-        xlims!(app.fft_axis, 0, FFT_MAX_FREQUENCY_HZ)
+        xlims!(
+            app.fft_axis,
+            0,
+            min(app.fft_max_frequency_hz, app.sample_rate / (2 * app.decimation)),
+        )
         return nothing
     end
-    pitch_spectrum = _amplitude_spectrum(inputs.pitch, inputs.sample_rate)
-    yaw_spectrum = _amplitude_spectrum(inputs.yaw, inputs.sample_rate)
+    pitch_spectrum = _amplitude_spectrum(
+        inputs.pitch,
+        inputs.sample_rate;
+        max_frequency = app.fft_max_frequency_hz,
+    )
+    yaw_spectrum = _amplitude_spectrum(
+        inputs.yaw,
+        inputs.sample_rate;
+        max_frequency = app.fft_max_frequency_hz,
+    )
     app.plot_fft_pitch_points[] = Point2f.(
         pitch_spectrum.frequency_hz,
         pitch_spectrum.amplitude,
@@ -813,7 +892,7 @@ function update_fft!(app::WhirlApp; force::Bool = false)
     )
     upper = max(FFT_MINIMUM_AMPLITUDE_DEGREES, 1.1 * maximum_amplitude)
     ylims!(app.fft_axis, 0, upper)
-    xlims!(app.fft_axis, 0, min(FFT_MAX_FREQUENCY_HZ, inputs.sample_rate / 2))
+    xlims!(app.fft_axis, 0, min(app.fft_max_frequency_hz, inputs.sample_rate / 2))
     return nothing
 end
 
@@ -1536,7 +1615,11 @@ function clear_data!(app::WhirlApp)
     app.rpm_text[] = "— RPM"
     ylims!(app.angle_axis, -ANGLE_MARGIN_DEGREES, ANGLE_MARGIN_DEGREES)
     ylims!(app.rpm_axis, 0, 6_500)
-    xlims!(app.fft_axis, 0, FFT_MAX_FREQUENCY_HZ)
+    xlims!(
+        app.fft_axis,
+        0,
+        min(app.fft_max_frequency_hz, app.sample_rate / (2 * app.decimation)),
+    )
     ylims!(app.fft_axis, 0, FFT_MINIMUM_AMPLITUDE_DEGREES)
     xlims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
     ylims!(app.orbit_axis, -ORBIT_MINIMUM_EXTENT_DEGREES, ORBIT_MINIMUM_EXTENT_DEGREES)
