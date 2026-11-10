@@ -5,11 +5,20 @@ using GLMakie
 import CairoMakie
 
 const LEGACY_WHIRL_CSV_COLUMNS = ("time_s", "sample_index", "pitch_deg", "yaw_deg", "rpm")
-const WHIRL_CSV_COLUMNS = (
+const MOTOR_WHIRL_CSV_COLUMNS = (
     LEGACY_WHIRL_CSV_COLUMNS...,
     "rpm_target",
     "esc_throttle",
     "ctrl_saturated",
+)
+const WHIRL_CSV_COLUMNS = (
+    MOTOR_WHIRL_CSV_COLUMNS...,
+    "servo1_angle_deg",
+    "servo2_angle_deg",
+    "servo_target_deg",
+    "servo_temperature_c",
+    "servo_voltage_v",
+    "servo_state",
 )
 const MAX_OFFLINE_PLOT_POINTS = 100_000
 const OFFLINE_ANGLE_MARGIN_DEGREES = 10.0
@@ -48,15 +57,22 @@ function read_whirl_csv(path::AbstractString)
     rpm_target = Float64[]
     esc_throttle = Float64[]
     ctrl_saturated = Float64[]
+    servo1_angle = Float64[]
+    servo2_angle = Float64[]
+    servo_target = Float64[]
+    servo_temperature = Float64[]
+    servo_voltage = Float64[]
+    servo_state = UInt32[]
     open(csv_path, "r") do io
         eof(io) && throw(ArgumentError("CSV file is empty: $csv_path"))
         columns = Tuple(strip.(split(readline(io), ',')))
-        columns in (LEGACY_WHIRL_CSV_COLUMNS, WHIRL_CSV_COLUMNS) || throw(
+        columns in (LEGACY_WHIRL_CSV_COLUMNS, MOTOR_WHIRL_CSV_COLUMNS, WHIRL_CSV_COLUMNS) || throw(
             ArgumentError(
-                "expected legacy or motor-control whirl CSV columns; received $(join(columns, ','))",
+                "expected legacy, motor-control, or servo whirl CSV columns; received $(join(columns, ','))",
             ),
         )
-        has_motor_control = columns == WHIRL_CSV_COLUMNS
+        has_motor_control = columns != LEGACY_WHIRL_CSV_COLUMNS
+        has_servo = columns == WHIRL_CSV_COLUMNS
         for (offset, line) in enumerate(eachline(io))
             line_number = offset + 1
             isempty(strip(line)) && continue
@@ -77,9 +93,34 @@ function read_whirl_csv(path::AbstractString)
                 _parse_csv_value(Float64, fields[7], line_number, "esc_throttle") : 0.0
             saturated_value = has_motor_control ?
                 _parse_csv_value(Float64, fields[8], line_number, "ctrl_saturated") : 0.0
+            servo1_value = has_servo ?
+                _parse_csv_value(Float64, fields[9], line_number, "servo1_angle_deg") : 0.0
+            servo2_value = has_servo ?
+                _parse_csv_value(Float64, fields[10], line_number, "servo2_angle_deg") : 0.0
+            servo_target_value = has_servo ?
+                _parse_csv_value(Float64, fields[11], line_number, "servo_target_deg") : 0.0
+            servo_temperature_value = has_servo ?
+                _parse_csv_value(Float64, fields[12], line_number, "servo_temperature_c") : 0.0
+            servo_voltage_value = has_servo ?
+                _parse_csv_value(Float64, fields[13], line_number, "servo_voltage_v") : 0.0
+            servo_state_value = has_servo ?
+                _parse_csv_value(UInt32, fields[14], line_number, "servo_state") : UInt32(0)
             all(
                 isfinite,
-                (time, pitch_value, yaw_value, rpm_value, target_value, throttle_value, saturated_value),
+                (
+                    time,
+                    pitch_value,
+                    yaw_value,
+                    rpm_value,
+                    target_value,
+                    throttle_value,
+                    saturated_value,
+                    servo1_value,
+                    servo2_value,
+                    servo_target_value,
+                    servo_temperature_value,
+                    servo_voltage_value,
+                ),
             ) ||
                 throw(ArgumentError("non-finite value on CSV row $line_number"))
             push!(times, time)
@@ -90,6 +131,12 @@ function read_whirl_csv(path::AbstractString)
             push!(rpm_target, target_value)
             push!(esc_throttle, throttle_value)
             push!(ctrl_saturated, saturated_value)
+            push!(servo1_angle, servo1_value)
+            push!(servo2_angle, servo2_value)
+            push!(servo_target, servo_target_value)
+            push!(servo_temperature, servo_temperature_value)
+            push!(servo_voltage, servo_voltage_value)
+            push!(servo_state, servo_state_value)
         end
     end
     isempty(times) && throw(ArgumentError("CSV file contains no samples: $csv_path"))
@@ -104,6 +151,12 @@ function read_whirl_csv(path::AbstractString)
         rpm_target = rpm_target,
         esc_throttle = esc_throttle,
         ctrl_saturated = ctrl_saturated,
+        servo1_angle_deg = servo1_angle,
+        servo2_angle_deg = servo2_angle,
+        servo_target_deg = servo_target,
+        servo_temperature_c = servo_temperature,
+        servo_voltage_v = servo_voltage,
+        servo_state = servo_state,
     )
 end
 

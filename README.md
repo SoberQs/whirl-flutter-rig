@@ -120,6 +120,15 @@ discarded. The original bytes are retained by renaming the source to
 whose header is invalid or which contain no complete data rows are left
 untouched and reported as failures.
 
+Each capture row also records the most recent dual-servo snapshot in
+`servo1_angle_deg`, `servo2_angle_deg`, `servo_target_deg`,
+`servo_temperature_c`, `servo_voltage_v`, and `servo_state`. Servo telemetry
+is polled at approximately 2 Hz and repeated across the higher-rate DAQ rows
+until the next snapshot. If the servo pair is not online, all six fields are
+written as zero. Use `servo_state` to distinguish that case from a real
+zero-degree position: bits `0x01` and `0x04` indicate that IDs 1 and 2 are
+online, respectively.
+
 ### Motor operation
 
 The GUI requires motor-control firmware whose discovered sources include
@@ -142,6 +151,45 @@ disarmed with zero manual throttle and a zero RPM target.
    output limit.
 5. Press Space or **STOP / DISARM** at any time. Pause, window closure, stream
    failure, and control-link closure also disarm the firmware.
+
+### Servo operation
+
+The GUI requires dual-servo firmware exposing `servo_offset_deg`,
+`servo_enable`, `servo_align`, `servo_state`, both
+`servo_position_deg`/`servo2_position_deg`, `servo_voltage_v`,
+`servo_temperature_c`, `servo_status`, the two-element `servo_limits_deg`, and
+the edge-triggered `servo_fast_target_deg`. Both servos start with torque off;
+they must have distinct IDs 1 and 2 before normal operation.
+
+1. Leave the U-shaped linkage detached. Start acquisition and confirm the
+   servo line reports both IDs online, plausible voltage and temperature, and
+   packed status `0x0000`.
+2. Click **ALIGN SERVOS (rod detached)**. Wait until the line reports
+   `ALIGNED` and both logical positions are near 0 degrees, then install the
+   linkage without rotating either horn. The pictured mirrored installation
+   is configured so servo 2 receives the opposite raw direction.
+3. Press **J** for a negative one-degree synchronous step or **K** for a
+   positive one-degree synchronous step. Key repeat is limited to 20 commands
+   per second.
+4. Enter one angle in **Fast target** and press Enter to command both servos at
+   the maximum SMS/STS speed and acceleration values. This is an immediate
+   motion command, not merely a saved value. The GUI and MCU both reject
+   targets outside the fixed ±100-degree hard range. Space releases torque.
+
+The ±100-degree hard range does not prove that the fitted linkage has adequate
+clearance. Establish safe travel with slow J/K movements before using the fast
+target, and do not enter a large step while anyone is touching the mechanism.
+5. Press Space or **STOP / DISARM** to release both servo torques as well as
+   stopping the rotor drive. Pause and window closure do the same. Alignment
+   is then invalidated and must be repeated before J/K is accepted. While
+   enabled, the GUI refreshes the firmware lease twice per second; loss of the
+   control link releases both torques after approximately two seconds.
+
+Keyboard commands are ignored while a text box has focus. Perform the first
+synchronised movement with the linkage detached, both horns unloaded, the
+mechanism restrained, and the 6 V supply disconnect within reach. If the two
+horns rotate in opposite physical linkage directions, do not attach the rod;
+correct `SERVO_DIRECTIONS` in the firmware configuration first.
 
 The GUI reads the MCU's `arm` and `safety` parameters twice per second. Its
 `ARMED`, `DISARMED`, and `TRIPPED` text therefore reflects the firmware safety
@@ -193,8 +241,10 @@ currently flashed firmware starts its missing-feedback timer at 15% throttle.
 That covers only the upper part of the loaded profile and none of the unloaded
 profile, so low-speed physical feedback-loss protection remains outstanding.
 
-The CSV format now adds `rpm_target`, `esc_throttle`, and `ctrl_saturated`.
-`src/plot.jl` remains compatible with older five-column captures.
+The CSV format includes `rpm_target`, `esc_throttle`, `ctrl_saturated`, the
+five servo values described above, and `servo_state`. `src/plot.jl` remains
+compatible with older five-column and eight-column captures, returning zero
+for servo fields that were not present in those files.
 
 Run the GUI-side validation and CSV compatibility tests with:
 

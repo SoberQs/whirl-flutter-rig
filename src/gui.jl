@@ -26,7 +26,10 @@ const MAX_PLOT_POINTS = 2_000
 const PLOT_REFRESH_SECONDS = 0.025
 const CAPTURE_FLUSH_SECONDS = 1.0
 const CAPTURE_DIRECTORY = normpath(joinpath(@__DIR__, "..", "captures"))
-const CAPTURE_HEADER = "time_s,sample_index,pitch_deg,yaw_deg,rpm,rpm_target,esc_throttle,ctrl_saturated"
+const MOTOR_CAPTURE_HEADER =
+    "time_s,sample_index,pitch_deg,yaw_deg,rpm,rpm_target,esc_throttle,ctrl_saturated"
+const CAPTURE_HEADER = MOTOR_CAPTURE_HEADER *
+    ",servo1_angle_deg,servo2_angle_deg,servo_target_deg,servo_temperature_c,servo_voltage_v,servo_state"
 const STREAM_TIMEOUT_SECONDS = 5.0
 const MAX_STREAM_RESTARTS = 3
 const CONTROL_STATE_POLL_SECONDS = 0.5
@@ -39,6 +42,18 @@ const FFT_MAX_FREQUENCY_HZ = 200.0
 const FFT_MINIMUM_AMPLITUDE_DEGREES = 0.1
 const RPM_MARGIN = 1_000.0
 const MOTOR_COMMAND_INTERVAL_SECONDS = 0.05
+const SERVO_COMMAND_INTERVAL_SECONDS = 0.05
+const SERVO_STEP_DEGREES = 1.0f0
+const SERVO_MIN_OFFSET_DEGREES = -100.0f0
+const SERVO_MAX_OFFSET_DEGREES = 100.0f0
+const SERVO_STATE_1_ONLINE = UInt32(1 << 0)
+const SERVO_STATE_1_TORQUE_ENABLED = UInt32(1 << 1)
+const SERVO_STATE_2_ONLINE = UInt32(1 << 2)
+const SERVO_STATE_2_TORQUE_ENABLED = UInt32(1 << 3)
+const SERVO_STATE_ALIGNED = UInt32(1 << 4)
+const SERVO_STATE_PAIR_ONLINE = SERVO_STATE_1_ONLINE | SERVO_STATE_2_ONLINE
+const SERVO_STATE_PAIR_TORQUE_ENABLED =
+    SERVO_STATE_1_TORQUE_ENABLED | SERVO_STATE_2_TORQUE_ENABLED
 
 mutable struct CaptureWriter
     partial_path::String
@@ -63,6 +78,18 @@ struct PlotSample
     ctrl_saturated::Float32
     esc_throttle::Float32
 end
+
+struct ServoCaptureSample
+    servo1_angle_degrees::Float32
+    servo2_angle_degrees::Float32
+    target_degrees::Float32
+    temperature_c::Float32
+    voltage_v::Float32
+    state::UInt32
+end
+
+const ZERO_SERVO_CAPTURE_SAMPLE =
+    ServoCaptureSample(0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0, UInt32(0))
 
 mutable struct PlotRingBuffer
     storage::Vector{PlotSample}
@@ -185,6 +212,7 @@ mutable struct WhirlApp
     motor_text::Observable{String}
     target_range_text::Observable{String}
     manual_step_text::Observable{String}
+    servo_text::Observable{String}
     manual_throttle::Float32
     target_rpm::Float32
     motor_mode::Symbol
@@ -195,6 +223,19 @@ mutable struct WhirlApp
     safety_flags::UInt32
     motor_busy::Bool
     last_motor_command_s::Float64
+    servo_offset_degrees::Float32
+    servo_position_degrees::Float32
+    servo2_position_degrees::Float32
+    servo_voltage_v::Float32
+    servo_temperature_c::Float32
+    servo_status::UInt32
+    servo_state::UInt32
+    servo_online::Bool
+    servo_enabled::Bool
+    servo_torque_enabled::Bool
+    servo_aligned::Bool
+    servo_busy::Bool
+    last_servo_command_s::Float64
     lower_plot_mode::Symbol
     last_fft_update_s::Float64
     fft_max_frequency_hz::Float64
@@ -208,6 +249,7 @@ mutable struct WhirlApp
     fft_legend::Any
     save_path::Any
     target_rpm_box::Any
+    servo_target_box::Any
     profile_menu::Any
     figure::Any
 end
@@ -256,8 +298,9 @@ function WhirlApp(host, demo, decimation, window_seconds; capture_directory = CA
         Observable(demo ? "Demo mode — click Start" : "Target: $host"),
         Observable("— RPM"),
         Observable("DISARMED · MANUAL · 0%"),
-        Observable("Target: 0 or $(Int(motor_profile.target_min_rpm))–$(Int(motor_profile.target_max_rpm)) RPM · Enter"),
-        Observable("Manual: ↑/↓ = one ESC pulse step · Space = STOP"),
+        Observable("RPM target: 0 / $(Int(motor_profile.target_min_rpm))–$(Int(motor_profile.target_max_rpm))"),
+        Observable("↑/↓: one ESC step · Space: STOP"),
+        Observable("SERVO PAIR OFFLINE · align before J/K · Space = release torque"),
         0.0f0,
         0.0f0,
         :manual,
@@ -268,9 +311,23 @@ function WhirlApp(host, demo, decimation, window_seconds; capture_directory = CA
         UInt32(0),
         false,
         -Inf,
+        0.0f0,
+        0.0f0,
+        0.0f0,
+        0.0f0,
+        0.0f0,
+        UInt32(0),
+        UInt32(0),
+        false,
+        false,
+        false,
+        false,
+        false,
+        -Inf,
         :rpm,
         -Inf,
         FFT_MAX_FREQUENCY_HZ,
+        nothing,
         nothing,
         nothing,
         nothing,
@@ -302,11 +359,14 @@ function build_figure!(app::WhirlApp)
             ),
         ),
     )
-    figure = Figure(; size = (1540, 1080), figure_padding = 24)
+    # Keep the canvas close to a 16:10 desktop aspect ratio. A taller canvas
+    # gets clipped when GLMakie scales the window to the available screen.
+    figure = Figure(; size = (1540, 960), figure_padding = 18)
+    rowgap!(figure.layout, 6)
     Label(
         figure[1, 1:2],
         "HELIC-DAQ · Whirl Rig Live Monitor";
-        fontsize = 28,
+        fontsize = 25,
         font = :bold,
         color = RGBf(0.08, 0.15, 0.28),
         tellwidth = false,
@@ -315,7 +375,7 @@ function build_figure!(app::WhirlApp)
     Label(
         figure[2, 1:2],
         mode_label;
-        fontsize = 13,
+        fontsize = 12,
         color = RGBf(0.32, 0.42, 0.58),
         tellwidth = false,
     )
@@ -423,7 +483,7 @@ function build_figure!(app::WhirlApp)
         tellwidth = true,
         width = 380,
         valign = :top,
-        rowgap = 10,
+        rowgap = 4,
     )
     figure[3:4, 2] = controls
     speed_summary = GridLayout(; colgap = 8)
@@ -440,46 +500,46 @@ function build_figure!(app::WhirlApp)
     Label(
         speed_summary[1, 2],
         app.rpm_text;
-        fontsize = 27,
+        fontsize = 24,
         font = :bold,
         halign = :right,
         tellwidth = false,
         color = RGBf(0.08, 0.52, 0.36),
     )
 
-    motor_controls = GridLayout(; colgap = 8, rowgap = 4)
+    motor_controls = GridLayout(; colgap = 8, rowgap = 2)
     controls[2, 1] = motor_controls
-    Label(motor_controls[1, 1:2], "Motor control"; fontsize = 19, font = :bold, halign = :left, tellwidth = false)
-    Label(motor_controls[2, 1:2], "Motor profile"; halign = :left, tellwidth = false, fontsize = 12)
     profile_options = [(profile.label, profile.id) for profile in app.profile_set.profiles]
     profile_menu = Menu(
-        motor_controls[3, 1:2];
+        motor_controls[1, 1:2];
         options = profile_options,
         default = app.motor_profile.label,
+        height = 30,
         width = 360,
         tellwidth = false,
     )
-    manual_button = Button(motor_controls[4, 1]; label = "Manual", height = 34, width = 172, tellwidth = false)
-    speed_button = Button(motor_controls[4, 2]; label = "Closed loop", height = 34, width = 172, tellwidth = false)
+    manual_button = Button(motor_controls[2, 1]; label = "Manual", height = 30, width = 172, tellwidth = false)
+    speed_button = Button(motor_controls[2, 2]; label = "Closed loop", height = 30, width = 172, tellwidth = false)
     Label(
-        motor_controls[5, 1:2],
+        motor_controls[3, 1],
         app.target_range_text;
         halign = :left,
         tellwidth = false,
-        fontsize = 12,
+        width = 172,
+        fontsize = 11,
     )
     target_rpm_box = Textbox(
-        motor_controls[6, 1:2];
+        motor_controls[3, 2];
         placeholder = "e.g. 2500",
-        height = 34,
-        width = 150,
+        height = 30,
+        width = 172,
         tellwidth = false,
         halign = :left,
     )
     arm_button = Button(
-        motor_controls[7, 1];
+        motor_controls[4, 1];
         label = "ARM",
-        height = 34,
+        height = 30,
         width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.15, 0.67, 0.46),
@@ -488,9 +548,9 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     stop_button = Button(
-        motor_controls[7, 2];
+        motor_controls[4, 2];
         label = "STOP / DISARM",
-        height = 34,
+        height = 30,
         width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.76, 0.16, 0.2),
@@ -499,34 +559,83 @@ function build_figure!(app::WhirlApp)
         labelcolor_hover = :white,
     )
     Label(
-        motor_controls[8, 1:2],
+        motor_controls[5, 1:2],
         app.manual_step_text;
         halign = :left,
         tellwidth = false,
         width = 360,
-        fontsize = 12,
+        fontsize = 11,
         color = RGBf(0.32, 0.38, 0.48),
         word_wrap = true,
     )
     Label(
-        motor_controls[9, 1:2],
+        motor_controls[6, 1:2],
         app.motor_text;
         halign = :left,
         tellwidth = false,
         width = 360,
-        fontsize = 13,
+        fontsize = 12,
         font = :bold,
         color = RGBf(0.55, 0.12, 0.16),
         word_wrap = true,
     )
+    Label(
+        motor_controls[7, 1:2],
+        "Servo control · J/K = 1° trim · hard limit ±100°";
+        halign = :left,
+        tellwidth = false,
+        width = 360,
+        fontsize = 11,
+        color = RGBf(0.32, 0.38, 0.48),
+        word_wrap = true,
+    )
+    align_servo_button = Button(
+        motor_controls[8, 1:2];
+        label = "ALIGN SERVOS (rod detached)",
+        height = 30,
+        width = 360,
+        tellwidth = false,
+        buttoncolor = RGBf(0.24, 0.48, 0.78),
+        buttoncolor_hover = RGBf(0.18, 0.39, 0.69),
+        labelcolor = :white,
+        labelcolor_hover = :white,
+    )
+    Label(
+        motor_controls[9, 1],
+        "Fast target [°]";
+        halign = :left,
+        tellwidth = false,
+        width = 172,
+        fontsize = 11,
+        color = RGBf(0.68, 0.16, 0.12),
+    )
+    servo_target_box = Textbox(
+        motor_controls[9, 2];
+        placeholder = "Enter = max speed",
+        height = 30,
+        width = 172,
+        tellwidth = false,
+        halign = :left,
+    )
+    Label(
+        motor_controls[10, 1:2],
+        app.servo_text;
+        halign = :left,
+        tellwidth = false,
+        width = 360,
+        fontsize = 12,
+        font = :bold,
+        color = RGBf(0.14, 0.32, 0.58),
+        word_wrap = true,
+    )
 
-    acquisition_controls = GridLayout(; colgap = 8, rowgap = 4)
+    acquisition_controls = GridLayout(; colgap = 8, rowgap = 2)
     controls[3, 1] = acquisition_controls
-    Label(acquisition_controls[1, 1:2], "Acquisition"; fontsize = 18, font = :bold, halign = :left, tellwidth = false)
+    Label(acquisition_controls[1, 1:2], "Acquisition"; fontsize = 16, font = :bold, halign = :left, tellwidth = false)
     start_button = Button(
         acquisition_controls[2, 1];
         label = "Start",
-        height = 34,
+        height = 30,
         width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.15, 0.67, 0.46),
@@ -537,7 +646,7 @@ function build_figure!(app::WhirlApp)
     pause_button = Button(
         acquisition_controls[2, 2];
         label = "Pause + Disarm",
-        height = 34,
+        height = 30,
         width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.96, 0.65, 0.16),
@@ -548,7 +657,7 @@ function build_figure!(app::WhirlApp)
     save_button = Button(
         acquisition_controls[3, 1];
         label = "Save CSV",
-        height = 34,
+        height = 30,
         width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.16, 0.43, 0.78),
@@ -559,7 +668,7 @@ function build_figure!(app::WhirlApp)
     clear_button = Button(
         acquisition_controls[3, 2];
         label = "Clear",
-        height = 34,
+        height = 30,
         width = 172,
         tellwidth = false,
         buttoncolor = RGBf(0.76, 0.29, 0.34),
@@ -570,37 +679,38 @@ function build_figure!(app::WhirlApp)
     recover_button = Button(
         acquisition_controls[4, 1:2];
         label = "Recover crash files",
-        height = 30,
+        height = 26,
         width = 360,
         tellwidth = false,
     )
-    Label(
-        acquisition_controls[5, 1:2],
-        "Optional save path (press Enter)";
-        halign = :left,
-        tellwidth = false,
-        fontsize = 12,
-        color = RGBf(0.32, 0.38, 0.48),
-    )
     save_path = Textbox(
-        acquisition_controls[6, 1:2];
-        placeholder = "auto: captures/whirl_*.csv",
-        height = 34,
+        acquisition_controls[5, 1:2];
+        placeholder = "Save path (optional) · Enter",
+        height = 28,
         tellwidth = false,
         halign = :left,
     )
 
-    status_controls = GridLayout(; rowgap = 4)
+    status_controls = GridLayout(; rowgap = 2)
     controls[4, 1] = status_controls
-    Label(status_controls[1, 1], app.status_text; fontsize = 17, font = :bold, halign = :left, tellwidth = false)
-    Label(status_controls[2, 1], app.stats_text; fontsize = 12, halign = :left, tellwidth = false, color = RGBf(0.25, 0.32, 0.43))
+    Label(status_controls[1, 1], app.status_text; fontsize = 15, font = :bold, halign = :left, tellwidth = false)
+    Label(
+        status_controls[2, 1],
+        app.stats_text;
+        fontsize = 10,
+        halign = :left,
+        tellwidth = false,
+        width = 360,
+        word_wrap = true,
+        color = RGBf(0.25, 0.32, 0.43),
+    )
     Label(
         status_controls[3, 1],
         app.info_text;
         halign = :left,
         tellwidth = false,
         width = 360,
-        fontsize = 12,
+        fontsize = 11,
         color = RGBf(0.25, 0.32, 0.43),
         justification = :left,
         word_wrap = true,
@@ -620,6 +730,7 @@ function build_figure!(app::WhirlApp)
     app.fft_legend = fft_legend
     app.save_path = save_path
     app.target_rpm_box = target_rpm_box
+    app.servo_target_box = servo_target_box
     app.profile_menu = profile_menu
     app.figure = figure
 
@@ -668,6 +779,14 @@ function build_figure!(app::WhirlApp)
         @async emergency_stop!(app)
         return nothing
     end
+    on(align_servo_button.clicks) do _
+        @async align_servos!(app)
+        return nothing
+    end
+    on(servo_target_box.stored_string) do text
+        isnothing(text) || @async command_fast_servo_target!(app, text)
+        return nothing
+    end
     on(target_rpm_box.stored_string) do text
         isnothing(text) || @async set_target_rpm!(app, text)
         return nothing
@@ -677,11 +796,16 @@ function build_figure!(app::WhirlApp)
         return nothing
     end
     on(events(figure).keyboardbutton, priority = 10) do event
-        typing = target_rpm_box.focused[] || fft_frequency_box.focused[] || save_path.focused[]
+        typing = target_rpm_box.focused[] || fft_frequency_box.focused[] ||
+            save_path.focused[] || servo_target_box.focused[]
         active = event.action == Keyboard.press || event.action == Keyboard.repeat
         if !typing && active && event.key in (Keyboard.up, Keyboard.down)
             direction = event.key == Keyboard.up ? 1 : -1
             @async adjust_manual_throttle!(app, direction)
+            return Consume(true)
+        elseif !typing && active && event.key in (Keyboard.j, Keyboard.k)
+            direction = event.key == Keyboard.k ? 1 : -1
+            @async adjust_servo!(app, direction)
             return Consume(true)
         elseif !typing && event.action == Keyboard.press && event.key == Keyboard.space
             @async emergency_stop!(app)
@@ -947,6 +1071,138 @@ function _update_motor_text!(app::WhirlApp)
     return nothing
 end
 
+function _update_servo_text!(app::WhirlApp)
+    if !app.servo_online
+        first_state = app.servo_state & SERVO_STATE_1_ONLINE != 0 ? "online" : "offline"
+        second_state = app.servo_state & SERVO_STATE_2_ONLINE != 0 ? "online" : "offline"
+        app.servo_text[] =
+            "PAIR NOT READY · ID 1 $first_state · ID 2 $second_state · check unique IDs and 6 V"
+        return nothing
+    end
+    torque = app.servo_torque_enabled ? "ENABLED" : "TORQUE OFF"
+    alignment = app.servo_aligned ? "ALIGNED" : "ALIGN REQUIRED"
+    app.servo_text[] = @sprintf(
+        "%s · %s · S1 %+.1f° · S2 %+.1f° · target %+.1f° · %.1f V · %.0f °C · status 0x%04X",
+        torque,
+        alignment,
+        app.servo_position_degrees,
+        app.servo2_position_degrees,
+        app.servo_offset_degrees,
+        app.servo_voltage_v,
+        app.servo_temperature_c,
+        app.servo_status,
+    )
+    return nothing
+end
+
+"""Parse one finite angle within the supplied hard limits."""
+function parse_servo_target(text, lower::Real, upper::Real)
+    lower < upper || throw(ArgumentError("servo limits must be ordered"))
+    value = tryparse(Float64, strip(String(text)))
+    isnothing(value) && throw(ArgumentError("enter a numeric servo target in degrees"))
+    isfinite(value) || throw(ArgumentError("servo target must be finite"))
+    lower <= value <= upper || throw(
+        ArgumentError(
+            @sprintf("servo target must be between %.1f° and %.1f°", lower, upper),
+        ),
+    )
+    return Float32(value)
+end
+
+"""Move a bounded servo offset by one signed keyboard step."""
+function servo_step(
+        current::Real,
+        direction::Integer;
+        step::Real = SERVO_STEP_DEGREES,
+        lower::Real = SERVO_MIN_OFFSET_DEGREES,
+        upper::Real = SERVO_MAX_OFFSET_DEGREES,
+    )
+    direction in (-1, 1) || throw(ArgumentError("direction must be -1 or 1"))
+    step > 0 || throw(ArgumentError("servo step must be positive"))
+    lower < upper || throw(ArgumentError("servo offset limits must be ordered"))
+    return Float32(clamp(current + direction * step, lower, upper))
+end
+
+function initialise_servo_control!(app::WhirlApp)
+    app.servo_offset_degrees = 0.0f0
+    app.servo_position_degrees = 0.0f0
+    app.servo2_position_degrees = 0.0f0
+    app.servo_voltage_v = 0.0f0
+    app.servo_temperature_c = 0.0f0
+    app.servo_status = UInt32(0)
+    app.servo_state = app.demo ? SERVO_STATE_PAIR_ONLINE : UInt32(0)
+    app.servo_enabled = false
+    app.servo_torque_enabled = false
+    app.servo_aligned = false
+    app.servo_online = app.demo
+    if !app.demo
+        _motor_device_available(app) || throw(HelicDAQ.DeviceError("servo control link is not connected"))
+        # Remove torque before resetting the startup-relative target.
+        app.device[:servo_enable] = UInt32(0)
+        app.device[:servo_limits_deg] = Float32[
+            SERVO_MIN_OFFSET_DEGREES,
+            SERVO_MAX_OFFSET_DEGREES,
+        ]
+        app.device[:servo_offset_deg] = 0.0f0
+        _sync_servo_state!(app; heartbeat = false)
+    end
+    _update_servo_text!(app)
+    return nothing
+end
+
+function _sync_servo_state!(app::WhirlApp; heartbeat::Bool = true)
+    if app.demo
+        app.servo_online = true
+        app.servo_torque_enabled = app.servo_enabled
+        if app.servo_enabled
+            app.servo_position_degrees = app.servo_offset_degrees
+            app.servo2_position_degrees = app.servo_offset_degrees
+        end
+        app.servo_state = SERVO_STATE_PAIR_ONLINE |
+            (app.servo_torque_enabled ? SERVO_STATE_PAIR_TORQUE_ENABLED : UInt32(0)) |
+            (app.servo_aligned ? SERVO_STATE_ALIGNED : UInt32(0))
+        _update_servo_text!(app)
+        return nothing
+    end
+    _motor_device_available(app) || throw(HelicDAQ.DeviceError("servo control link is not connected"))
+    app.servo_busy && return nothing
+    app.servo_busy = true
+    try
+        heartbeat && app.servo_enabled && (app.device[:servo_enable] = UInt32(1))
+        state = HelicDAQ.getparams(
+            app.device,
+            (
+                :servo_state,
+                :servo_position_deg,
+                :servo2_position_deg,
+                :servo_voltage_v,
+                :servo_temperature_c,
+                :servo_status,
+            ),
+        )
+        flags = UInt32(state.servo_state)
+        app.servo_state = flags
+        app.servo_online = flags & SERVO_STATE_PAIR_ONLINE == SERVO_STATE_PAIR_ONLINE
+        app.servo_torque_enabled =
+            flags & SERVO_STATE_PAIR_TORQUE_ENABLED == SERVO_STATE_PAIR_TORQUE_ENABLED
+        app.servo_aligned = flags & SERVO_STATE_ALIGNED != 0
+        app.servo_position_degrees = Float32(state.servo_position_deg)
+        app.servo2_position_degrees = Float32(state.servo2_position_deg)
+        app.servo_voltage_v = Float32(state.servo_voltage_v)
+        app.servo_temperature_c = Float32(state.servo_temperature_c)
+        app.servo_status = UInt32(state.servo_status)
+        if !app.servo_online
+            app.servo_enabled = false
+            app.servo_torque_enabled = false
+            app.servo_aligned = false
+        end
+        _update_servo_text!(app)
+    finally
+        app.servo_busy = false
+    end
+    return nothing
+end
+
 function _format_throttle(throttle::Real, profile::MotorProfile)
     digits = profile.manual_step_throttle < 0.005 ? 2 : 0
     return @sprintf("%.*f%%", digits, 100 * throttle)
@@ -955,11 +1211,11 @@ end
 function _update_profile_text!(app::WhirlApp)
     profile = app.motor_profile
     app.target_range_text[] =
-        "Target: 0 or $(Int(profile.target_min_rpm))–$(Int(profile.target_max_rpm)) RPM · Enter"
+        "RPM target: 0 / $(Int(profile.target_min_rpm))–$(Int(profile.target_max_rpm))"
     pulse_step_us =
         profile.manual_step_throttle * (profile.esc_max_pulse_us - profile.esc_min_pulse_us)
     app.manual_step_text[] =
-        "Manual: ↑/↓ = ±$(_format_throttle(profile.manual_step_throttle, profile)) (≈$(@sprintf("%.1f", pulse_step_us)) µs) · Space = STOP"
+        "↑/↓: ±$(_format_throttle(profile.manual_step_throttle, profile)) (≈$(@sprintf("%.1f", pulse_step_us)) µs) · Space: STOP"
     return nothing
 end
 
@@ -1192,21 +1448,164 @@ function adjust_manual_throttle!(app::WhirlApp, direction::Integer)
     return nothing
 end
 
+function align_servos!(app::WhirlApp)
+    app.running || begin
+        app.info_text[] = "Start live acquisition before aligning the servos"
+        return nothing
+    end
+    app.servo_online || begin
+        app.info_text[] = "Both servo IDs must be online before alignment"
+        return nothing
+    end
+    app.servo_busy && return nothing
+    app.servo_busy = true
+    try
+        if !app.demo
+            _motor_device_available(app) ||
+                throw(HelicDAQ.DeviceError("servo control link is not connected"))
+            app.device[:servo_align] = UInt32(1)
+        end
+        app.servo_offset_degrees = 0.0f0
+        app.servo_enabled = true
+        app.servo_aligned = app.demo
+        if app.demo
+            app.servo_torque_enabled = true
+            app.servo_position_degrees = 0.0f0
+            app.servo2_position_degrees = 0.0f0
+        end
+        app.info_text[] =
+            "Aligning both servos to 180°; keep the U-shaped linkage detached until ALIGNED"
+    catch error
+        app.status_text[] = "Servo alignment error"
+        app.info_text[] = sprint(showerror, error)
+    finally
+        app.servo_busy = false
+        _update_servo_text!(app)
+    end
+    return nothing
+end
+
+function command_fast_servo_target!(app::WhirlApp, text)
+    app.running || begin
+        app.info_text[] = "Start live acquisition before commanding the servos"
+        return nothing
+    end
+    app.servo_online || begin
+        app.info_text[] = "Both servo IDs must be online before a fast move"
+        return nothing
+    end
+    app.servo_aligned || begin
+        app.info_text[] = "Press ALIGN BOTH and wait for ALIGNED before a fast move"
+        return nothing
+    end
+    target = try
+        parse_servo_target(
+            text,
+            SERVO_MIN_OFFSET_DEGREES,
+            SERVO_MAX_OFFSET_DEGREES,
+        )
+    catch error
+        app.status_text[] = "Servo target error"
+        app.info_text[] = sprint(showerror, error)
+        return nothing
+    end
+    app.servo_busy && return nothing
+    app.servo_busy = true
+    try
+        if !app.demo
+            _motor_device_available(app) ||
+                throw(HelicDAQ.DeviceError("servo control link is not connected"))
+            # One edge-triggered parameter carries both the target and maximum
+            # motion profile, so no stale target can run at maximum speed.
+            app.device[:servo_fast_target_deg] = target
+        end
+        app.servo_offset_degrees = target
+        app.servo_enabled = true
+        if app.demo
+            app.servo_torque_enabled = true
+            app.servo_position_degrees = target
+            app.servo2_position_degrees = target
+        end
+        _restore_normal_status!(app)
+        app.info_text[] = @sprintf(
+            "FAST dual-servo target %+.1f° commanded; Space = immediate torque release",
+            target,
+        )
+    catch error
+        app.status_text[] = "Servo fast-command error"
+        app.info_text[] = sprint(showerror, error)
+    finally
+        app.servo_busy = false
+        _update_servo_text!(app)
+    end
+    return nothing
+end
+
+function adjust_servo!(app::WhirlApp, direction::Integer)
+    app.running || begin
+        app.info_text[] = "Start live acquisition before controlling the servo"
+        return nothing
+    end
+    app.servo_online || begin
+        app.info_text[] = "Both servos must be online; check IDs 1/2, 6 V, and TTL-Bus wiring"
+        return nothing
+    end
+    app.servo_aligned || begin
+        app.info_text[] = "Press ALIGN BOTH and wait for ALIGNED before using J/K"
+        return nothing
+    end
+    now_s = time()
+    now_s - app.last_servo_command_s >= SERVO_COMMAND_INTERVAL_SECONDS || return nothing
+    app.servo_busy && return nothing
+    app.servo_busy = true
+    app.last_servo_command_s = now_s
+    target = servo_step(app.servo_offset_degrees, direction)
+    try
+        if !app.demo
+            _motor_device_available(app) || throw(HelicDAQ.DeviceError("servo control link is not connected"))
+            # Set the bounded goal before enabling torque, so the first key
+            # press cannot pull the servo towards a stale power-up target.
+            app.device[:servo_offset_deg] = target
+            app.device[:servo_enable] = UInt32(1)
+        end
+        app.servo_offset_degrees = target
+        app.servo_enabled = true
+        app.demo && begin
+            app.servo_torque_enabled = true
+            app.servo_position_degrees = target
+            app.servo2_position_degrees = target
+        end
+        app.info_text[] = @sprintf("Dual-servo target %+.1f° from aligned centre", target)
+    catch error
+        app.status_text[] = "Servo command error"
+        app.info_text[] = sprint(showerror, error)
+    finally
+        app.servo_busy = false
+        _update_servo_text!(app)
+    end
+    return nothing
+end
+
 function emergency_stop!(app::WhirlApp; report::Bool = true)
     # Let an in-flight arm or throttle request finish before issuing disarm;
     # otherwise an older request could arrive after the stop request.
-    while app.motor_busy
+    while app.motor_busy || app.servo_busy
         yield()
     end
     app.motor_busy = true
+    app.servo_busy = true
     app.armed = false
     app.manual_throttle = 0.0f0
     app.target_rpm = 0.0f0
     app.motor_mode = :manual
+    app.servo_enabled = false
+    app.servo_torque_enabled = false
+    app.servo_aligned = false
     _update_motor_text!(app)
-    message = "Motor disarmed and commands cleared"
-    try
-        if !app.demo && _motor_device_available(app)
+    _update_servo_text!(app)
+    errors = String[]
+    if !app.demo && _motor_device_available(app)
+        try
             # The first accepted write removes drive. The remaining writes
             # establish a zero-command state for any later re-arm.
             app.device[:arm] = UInt32(0)
@@ -1214,20 +1613,47 @@ function emergency_stop!(app::WhirlApp; report::Bool = true)
             app.device[:ctrl_mode] = MANUAL_MODE
             app.device[:target_coeffs] = _target_coefficients(app.device, 0.0f0)
             _sync_safety_state!(app; report_trip = false)
-        else
-            app.tripped = false
-            app.safety_flags = UInt32(0)
+        catch error
+            push!(errors, "motor: $(sprint(showerror, error))")
         end
-    catch error
-        message = "Disarm link error: $(sprint(showerror, error)); closing the control link also disarms"
-    finally
-        app.motor_busy = false
+        try
+            app.device[:servo_enable] = UInt32(0)
+        catch error
+            push!(errors, "servo: $(sprint(showerror, error))")
+        end
+    else
+        app.tripped = false
+        app.safety_flags = UInt32(0)
     end
+    app.motor_busy = false
+    app.servo_busy = false
+    message = isempty(errors) ?
+        "Motor disarmed, commands cleared, and servo torque released" :
+        "Stop link error ($(join(errors, "; "))); MCU servo lease expires automatically"
     report && (app.info_text[] = message)
     return nothing
 end
 
-function _append_sample_locked!(app::WhirlApp, sample_index::UInt64, sample::PlotSample)
+function _servo_capture_sample(app::WhirlApp)
+    pair_online = app.servo_online &&
+        app.servo_state & SERVO_STATE_PAIR_ONLINE == SERVO_STATE_PAIR_ONLINE
+    pair_online || return ZERO_SERVO_CAPTURE_SAMPLE
+    return ServoCaptureSample(
+        app.servo_position_degrees,
+        app.servo2_position_degrees,
+        app.servo_offset_degrees,
+        app.servo_temperature_c,
+        app.servo_voltage_v,
+        app.servo_state,
+    )
+end
+
+function _append_sample_locked!(
+        app::WhirlApp,
+        sample_index::UInt64,
+        sample::PlotSample,
+        servo::ServoCaptureSample,
+    )
     if !isnothing(app.capture)
         writer = app.capture
         try
@@ -1248,6 +1674,18 @@ function _append_sample_locked!(app::WhirlApp, sample_index::UInt64, sample::Plo
                 sample.esc_throttle,
                 ',',
                 sample.ctrl_saturated,
+                ',',
+                servo.servo1_angle_degrees,
+                ',',
+                servo.servo2_angle_degrees,
+                ',',
+                servo.target_degrees,
+                ',',
+                servo.temperature_c,
+                ',',
+                servo.voltage_v,
+                ',',
+                servo.state,
             )
             writer.row_count += 1
             current_ns = UInt64(time_ns())
@@ -1270,6 +1708,7 @@ function append_packet!(app::WhirlApp, header, values)
     size(values, 2) == length(WHIRL_SOURCES) ||
         throw(ArgumentError("expected $(length(WHIRL_SOURCES)) whirl sources, received $(size(values, 2))"))
     lock(app.capture_lock) do
+        servo = _servo_capture_sample(app)
         for row in axes(values, 1)
             offset = UInt32(mod(UInt64(row - 1) * UInt64(header.decimation), UInt64(1) << 32))
             extended = _record_index!(app, header.first_index + offset)
@@ -1290,6 +1729,7 @@ function append_packet!(app::WhirlApp, header, values)
                     values[row, 5],
                     values[row, 6],
                 ),
+                servo,
             )
         end
     end
@@ -1301,6 +1741,7 @@ end
 function append_demo_chunk!(app::WhirlApp)
     count = max(1, round(Int, 0.02 * app.sample_rate / app.decimation))
     lock(app.capture_lock) do
+        servo = _servo_capture_sample(app)
         for _ in 1:count
             index = app.demo_index
             time_s = index / app.sample_rate
@@ -1329,6 +1770,7 @@ function append_demo_chunk!(app::WhirlApp)
                     0.0f0,
                     Float32(throttle),
                 ),
+                servo,
             )
             app.demo_index += UInt64(app.decimation)
         end
@@ -1357,13 +1799,24 @@ function _check_whirl_device(device::HelicDAQ.Device)
         :ctrl_ki,
         :ctrl_ramp,
         :target_coeffs,
+        :servo_offset_deg,
+        :servo_enable,
+        :servo_align,
+        :servo_limits_deg,
+        :servo_fast_target_deg,
+        :servo_state,
+        :servo_position_deg,
+        :servo2_position_deg,
+        :servo_voltage_v,
+        :servo_temperature_c,
+        :servo_status,
     )
     missing_parameters = [
         String(name) for name in required_parameters if !haskey(device.parameter_by_name, String(name))
     ]
     isempty(missing_parameters) || throw(
         HelicDAQ.DeviceError(
-            "firmware is missing motor parameters: $(join(missing_parameters, ", "))",
+            "firmware is missing control parameters: $(join(missing_parameters, ", "))",
         ),
     )
     return nothing
@@ -1379,6 +1832,7 @@ function start_receiving!(app::WhirlApp)
     try
         if app.demo
             initialise_motor_control!(app)
+            initialise_servo_control!(app)
             writer = _start_capture!(app)
             app.running = true
             app.status_text[] = "Receiving · DEMO"
@@ -1393,6 +1847,7 @@ function start_receiving!(app::WhirlApp)
         end
         _check_whirl_device(app.device)
         initialise_motor_control!(app)
+        initialise_servo_control!(app)
         device_status = HelicDAQ.status(app.device)
         app.sample_rate = Float64(device_status.sample_rate)
         _resize_plot_buffer!(
@@ -1442,7 +1897,13 @@ function start_receiving!(app::WhirlApp)
         app.running = false
         app.busy = false
         app.armed = false
+        app.servo_online = false
+        app.servo_enabled = false
+        app.servo_torque_enabled = false
+        app.servo_aligned = false
+        app.servo_state = UInt32(0)
         _update_motor_text!(app)
+        _update_servo_text!(app)
         _close_receiver!(app)
         _close_device!(app)
         partial_path = _close_partial_capture!(app)
@@ -1459,6 +1920,7 @@ function keepalive_loop!(app::WhirlApp, session::UInt64)
         app.running && session == app.session || break
         try
             _sync_safety_state!(app)
+            _sync_servo_state!(app)
         catch error
             app.running && session == app.session || break
             if error isa CaptureError
@@ -1467,7 +1929,13 @@ function keepalive_loop!(app::WhirlApp, session::UInt64)
             end
             app.running = false
             app.armed = false
+            app.servo_online = false
+            app.servo_enabled = false
+            app.servo_torque_enabled = false
+            app.servo_aligned = false
+            app.servo_state = UInt32(0)
             _update_motor_text!(app)
+            _update_servo_text!(app)
             app.status_text[] = "Control error"
             app.info_text[] = "Control heartbeat failed: $(sprint(showerror, error))"
             _close_receiver!(app)
@@ -1774,13 +2242,23 @@ function _close_partial_capture!(app::WhirlApp)
     end
 end
 
-function _capture_row_index(line::AbstractString)
+function _capture_field_count(header::AbstractString)
+    header == CAPTURE_HEADER && return 14
+    header == MOTOR_CAPTURE_HEADER && return 8
+    return nothing
+end
+
+function _capture_row_index(line::AbstractString, field_count::Integer = 14)
     fields = split(line, ','; keepempty = true)
-    length(fields) == 8 || return nothing
-    parsers = (Float64, UInt64, Float32, Float32, Float32, Float32, Float32, Float32)
-    values = ntuple(index -> tryparse(parsers[index], fields[index]), length(parsers))
-    any(isnothing, values) && return nothing
-    return values[2]
+    length(fields) == field_count || return nothing
+    isnothing(tryparse(Float64, fields[1])) && return nothing
+    sample_index = tryparse(UInt64, fields[2])
+    isnothing(sample_index) && return nothing
+    for index in 3:field_count
+        parser = field_count == 14 && index == 14 ? UInt32 : Float32
+        isnothing(tryparse(parser, fields[index])) && return nothing
+    end
+    return sample_index
 end
 
 function recover_partial_capture!(partial_path::AbstractString)
@@ -1799,17 +2277,19 @@ function recover_partial_capture!(partial_path::AbstractString)
     try
         open(path, "r") do input
             eof(input) && throw(ArgumentError("partial capture is empty"))
-            readline(input) == CAPTURE_HEADER ||
+            header = readline(input)
+            field_count = _capture_field_count(header)
+            isnothing(field_count) &&
                 throw(ArgumentError("partial capture has an unexpected header"))
             open(temporary_path, "w") do output
-                println(output, CAPTURE_HEADER)
+                println(output, header)
                 while !eof(input)
                     line = readline(input)
                     if eof(input) && !complete_ending
                         discarded_tail = true
                         break
                     end
-                    sample_index = _capture_row_index(line)
+                    sample_index = _capture_row_index(line, field_count)
                     if isnothing(sample_index) ||
                             (!isnothing(previous_index) && sample_index <= previous_index)
                         discarded_tail = true
@@ -1912,7 +2392,7 @@ function update_plots!(app::WhirlApp)
         isnothing(app.capture) ? UInt64(0) : app.capture.row_count
     end
     app.stats_text[] =
-        "Session: $(app.total_samples) samples\nCurrent file: $capture_rows\nDevice drops: $(app.dropped)\nUDP gaps: $(app.lost_packets)"
+        "Session $(app.total_samples) · file $capture_rows · device drops $(app.dropped) · UDP gaps $(app.lost_packets)"
     isempty(app.plot_buffer) && return nothing
     latest = app.plot_buffer[end]
     current_rpm = latest.rpm

@@ -86,6 +86,14 @@ end
         @test endswith(writer.partial_path, ".csv.partial")
         @test isfile(writer.partial_path)
 
+        app.servo_online = true
+        app.servo_state = UInt32(0x1f)
+        app.servo_position_degrees = 12.25f0
+        app.servo2_position_degrees = 12.5f0
+        app.servo_offset_degrees = 13.0f0
+        app.servo_temperature_c = 31.0f0
+        app.servo_voltage_v = 5.9f0
+
         header = (first_index = UInt32(20), decimation = UInt16(1), dropped = UInt32(0))
         values = Float32[
             0.1 0.2 100.0 110.0 0.0 0.1
@@ -95,6 +103,11 @@ end
         flush(writer.io)
         @test writer.row_count == 2
         @test length(readlines(writer.partial_path)) == 3
+        captured_fields = split(readlines(writer.partial_path)[2], ',')
+        @test length(captured_fields) == 14
+        @test parse.(Float32, captured_fields[9:13]) ==
+            Float32[12.25, 12.5, 13.0, 31.0, 5.9]
+        @test parse(UInt32, captured_fields[14]) == UInt32(0x1f)
 
         result = _finalize_capture!(app)
         @test result.rows == 2
@@ -110,6 +123,10 @@ end
         app.running = true
         append_demo_chunk!(app)
         first_rows = first_writer.row_count
+        flush(first_writer.io)
+        offline_fields = split(readlines(first_writer.partial_path)[2], ',')
+        @test parse.(Float32, offline_fields[9:13]) == zeros(Float32, 5)
+        @test parse(UInt32, offline_fields[14]) == UInt32(0)
         saved_path = save_csv!(app)
         @test isfile(saved_path)
         @test length(readlines(saved_path)) == first_rows + 1
@@ -126,8 +143,8 @@ end
     mktempdir() do directory
         partial_path = joinpath(directory, "interrupted.csv.partial")
         contents = CAPTURE_HEADER * "\n" *
-            "0.0,10,1.0,2.0,100.0,110.0,0.1,0.0\n" *
-            "0.0005,11,1.1,2.1,101.0,111.0,0.2,0.0\n" *
+            "0.0,10,1.0,2.0,100.0,110.0,0.1,0.0,3.0,3.1,3.2,28.0,6.0,31\n" *
+            "0.0005,11,1.1,2.1,101.0,111.0,0.2,0.0,3.3,3.4,3.5,28.0,6.0,31\n" *
             "0.001,12,broken"
         write(partial_path, contents)
 
@@ -139,7 +156,17 @@ end
         recovered_lines = readlines(result.recovered)
         @test recovered_lines[1] == CAPTURE_HEADER
         @test length(recovered_lines) == 3
-        @test endswith(recovered_lines[end], ",0.0")
+        @test endswith(recovered_lines[end], ",31")
+    end
+
+    mktempdir() do directory
+        old_partial_path = joinpath(directory, "old_motor.csv.partial")
+        old_contents = MOTOR_CAPTURE_HEADER * "\n" *
+            "0.0,10,1.0,2.0,100.0,110.0,0.1,0.0\n"
+        write(old_partial_path, old_contents)
+        result = recover_partial_capture!(old_partial_path)
+        @test result.rows == 1
+        @test first(readlines(result.recovered)) == MOTOR_CAPTURE_HEADER
     end
 
     mktempdir() do directory
@@ -171,6 +198,51 @@ const CINE66_PROP_PROFILE =
     @test_throws ArgumentError manual_step(0.5, 0)
     @test manual_step(0.2, 1; upper = 0.2) == 0.2f0
     @test_throws ArgumentError manual_step(0.1, 1; upper = 1.1)
+end
+
+@testset "bounded servo keyboard control" begin
+    @test parse_servo_target("12.5", -100, 100) == 12.5f0
+    @test_throws ArgumentError parse_servo_target("101", -100, 100)
+    @test_throws ArgumentError parse_servo_target("fast", -100, 100)
+    @test servo_step(0.0, -1) == -1.0f0
+    @test servo_step(0.0, 1) == 1.0f0
+    @test servo_step(-100.0, -1) == -100.0f0
+    @test servo_step(100.0, 1) == 100.0f0
+    @test_throws ArgumentError servo_step(0.0, 0)
+
+    app = WhirlApp("demo", true, 1, 10.0)
+    app.running = true
+    initialise_servo_control!(app)
+    adjust_servo!(app, -1)
+    @test !app.servo_enabled
+    @test occursin("ALIGN BOTH", app.info_text[])
+    align_servos!(app)
+    @test app.servo_aligned
+    @test app.servo_enabled
+    @test app.servo_torque_enabled
+    adjust_servo!(app, -1)
+    @test app.servo_enabled
+    @test app.servo_torque_enabled
+    @test app.servo_aligned
+    @test app.servo_offset_degrees == -1.0f0
+    @test app.servo_position_degrees == -1.0f0
+    @test app.servo2_position_degrees == -1.0f0
+    @test occursin("target -1.0°", app.servo_text[])
+    command_fast_servo_target!(app, "8.5")
+    @test app.servo_offset_degrees == 8.5f0
+    @test app.servo_position_degrees == 8.5f0
+    @test app.servo2_position_degrees == 8.5f0
+    @test occursin("FAST", app.info_text[])
+    app.last_servo_command_s = -Inf
+    adjust_servo!(app, 1)
+    @test app.servo_offset_degrees == 9.5f0
+    command_fast_servo_target!(app, "101")
+    @test app.servo_offset_degrees == 9.5f0
+    @test occursin("between -100.0° and 100.0°", app.info_text[])
+    emergency_stop!(app; report = false)
+    @test !app.servo_enabled
+    @test !app.servo_torque_enabled
+    @test !app.servo_aligned
 end
 
 @testset "profile-specific manual throttle" begin
@@ -321,6 +393,8 @@ end
         @test legacy.rpm == [4_000.0]
         @test legacy.rpm_target == [0.0]
         @test legacy.esc_throttle == [0.0]
+        @test legacy.servo1_angle_deg == [0.0]
+        @test legacy.servo_state == UInt32[0]
 
         motor_path = joinpath(directory, "motor.csv")
         write(
@@ -332,5 +406,21 @@ end
         @test motor.rpm_target == [4_000.0]
         @test motor.esc_throttle == [0.55]
         @test motor.ctrl_saturated == [1.0]
+        @test motor.servo2_angle_deg == [0.0]
+        @test motor.servo_voltage_v == [0.0]
+
+        servo_path = joinpath(directory, "servo.csv")
+        write(
+            servo_path,
+            CAPTURE_HEADER * "\n" *
+                "0.0,1,2.0,3.0,3900.0,4000.0,0.55,1.0,12.25,12.5,13.0,31.0,5.9,31\n",
+        )
+        servo = read_whirl_csv(servo_path)
+        @test servo.servo1_angle_deg == [12.25]
+        @test servo.servo2_angle_deg == [12.5]
+        @test servo.servo_target_deg == [13.0]
+        @test servo.servo_temperature_c == [31.0]
+        @test servo.servo_voltage_v == [5.9]
+        @test servo.servo_state == UInt32[0x1f]
     end
 end
